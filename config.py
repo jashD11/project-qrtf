@@ -1,5 +1,46 @@
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
+
+# Toggle to "PRODUCTION_ML" to activate the Phase 2 live-data tree pipeline.
+# "SANDBOX" keeps all Phase 1 GBM simulation paths active and unchanged.
+MODE: str = "SANDBOX"
+
+# Paths to historical NSE OHLCV datasets (used in PRODUCTION_ML mode only).
+DATA_DAILY_CSV: str = "data/daily_ohlcv.csv"
+DATA_15MIN_CSV: str = "data/15min_ohlcv.csv"
+
+
+@dataclass
+class _LGBMConfig:
+    learning_rate: float = 0.05
+    n_estimators: int = 100
+    max_depth: int = -1      # -1 = no limit (LightGBM default)
+    num_leaves: int = 31
+
+
+@dataclass
+class _XGBConfig:
+    learning_rate: float = 0.05
+    n_estimators: int = 100
+    max_depth: int = 6
+
+
+@dataclass
+class _RFConfig:
+    n_estimators: int = 100
+    max_depth: int = 15
+    min_samples_split: int = 5
+
+
+@dataclass
+class _MLConfig:
+    lgbm: _LGBMConfig = field(default_factory=_LGBMConfig)
+    xgb: _XGBConfig = field(default_factory=_XGBConfig)
+    rf: _RFConfig = field(default_factory=_RFConfig)
+
+
+ML_CONFIG: _MLConfig = _MLConfig()
 
 
 @dataclass
