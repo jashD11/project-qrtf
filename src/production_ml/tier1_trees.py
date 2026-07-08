@@ -61,15 +61,20 @@ from src.production_ml.feature_creator import (
     DATE_LEVEL,
     TICKER_LEVEL,
     FEATURE_COLUMNS,
+    PRICE_FEATURE_COLUMNS,
     TARGET_COLUMNS,
+    present_feature_columns,
 )
 
-# --- Walk-forward window sizing (in unique trading days) ------------------- #
+# --- Walk-forward window sizing (in unique TRADING DAYS, not bars — D2) ----- #
+# Windows are counted in calendar trading days so the tree gets enough history
+# regardless of how many intraday bars fall in a day. Per-frequency values live
+# in config.FREQ_REGISTRY; these are the daily defaults.
 TRAIN_WINDOW: Final[int] = 504   # ~2 trading years of history to fit on
 PREDICT_WINDOW: Final[int] = 63  # ~1 trading quarter scored out-of-sample
 
 # --- Default learning target and decile width ------------------------------ #
-DEFAULT_TARGET: Final[str] = "tgt_fwd_logret_1d"
+DEFAULT_TARGET: Final[str] = "tgt_fwd_logret_1b"
 DECILE_PCT: Final[float] = 0.10  # top / bottom 10% of the universe
 
 # --- Shared RNG seed so every run is reproducible -------------------------- #
@@ -132,6 +137,32 @@ class TreeAlphaEngine:
         self.train_window: int = train_window
         self.predict_window: int = predict_window
         self.decile_pct: float = decile_pct
+        # Feature schema is resolved from the input frame at run time (17 vs 19),
+        # so a price-only intraday panel and a full daily panel both work.
+        self.feature_cols: list[str] = list(FEATURE_COLUMNS)
+
+    @classmethod
+    def from_frequency(
+        cls,
+        frequency: str = config.DEFAULT_FREQUENCY,
+        target_col: str = DEFAULT_TARGET,
+        model_choice: str = "ensemble",
+        decile_pct: float = DECILE_PCT,
+    ) -> "TreeAlphaEngine":
+        """
+        Build an engine whose walk-forward windows come from ``FREQ_REGISTRY``.
+
+        The train/predict windows are in trading days (D2), so they are identical
+        across frequencies unless overridden per frequency in the registry.
+        """
+        spec = config.freq_spec(frequency)
+        return cls(
+            target_col=target_col,
+            model_choice=model_choice,
+            train_window=spec.train_days,
+            predict_window=spec.predict_days,
+            decile_pct=decile_pct,
+        )
 
     # ---------------------------------------------------------------------- #
     # Model factory
@@ -188,10 +219,14 @@ class TreeAlphaEngine:
         Alpha Score for the out-of-sample test block.
 
         Returns a Series indexed by the test block's ('date', 'ticker') rows.
+        Rows whose chosen target is NaN (trailing / cross-session labels kept by
+        the feature factory) are dropped from training only — every test row is
+        still scored, since prediction needs features, not a label.
         """
-        x_train: pd.DataFrame = train_df[FEATURE_COLUMNS]
-        y_train: pd.Series = train_df[self.target_col]
-        x_test: pd.DataFrame = test_df[FEATURE_COLUMNS]
+        train_ok: pd.Series = train_df[self.target_col].notna()
+        x_train: pd.DataFrame = train_df.loc[train_ok, self.feature_cols]
+        y_train: pd.Series = train_df.loc[train_ok, self.target_col]
+        x_test: pd.DataFrame = test_df[self.feature_cols]
 
         models = self._build_models()
         preds: list[np.ndarray] = []
@@ -221,11 +256,20 @@ class TreeAlphaEngine:
         """
         self._validate_input(features_df)
         df: pd.DataFrame = features_df.sort_index()
+        self.feature_cols = present_feature_columns(df)
 
-        unique_dates: np.ndarray = (
-            df.index.get_level_values(DATE_LEVEL).unique().sort_values().to_numpy()
+        # Walk-forward windows are in TRADING DAYS (D2). The 'date' level may hold
+        # intraday bar timestamps, so collapse each row to its calendar day and
+        # slide over unique days. Because df is sorted by (date, ticker), the
+        # per-row calendar day array is non-decreasing and folds are contiguous
+        # slices found by searchsorted — no per-day boolean scan.
+        row_days: np.ndarray = (
+            pd.DatetimeIndex(df.index.get_level_values(DATE_LEVEL))
+            .normalize()
+            .to_numpy()
         )
-        n_dates: int = len(unique_dates)
+        unique_days: np.ndarray = np.unique(row_days)
+        n_dates: int = len(unique_days)
         min_required: int = self.train_window + 1
         if n_dates < min_required:
             raise ValueError(
@@ -234,6 +278,12 @@ class TreeAlphaEngine:
                 f"got {n_dates}."
             )
 
+        def _slice(day_lo, day_hi_inclusive) -> pd.DataFrame:
+            """Contiguous row slice for the calendar-day span [lo, hi] inclusive."""
+            lo = int(np.searchsorted(row_days, day_lo, side="left"))
+            hi = int(np.searchsorted(row_days, day_hi_inclusive, side="right"))
+            return df.iloc[lo:hi]
+
         oos_scores: list[pd.Series] = []
         n_folds: int = 0
 
@@ -241,17 +291,14 @@ class TreeAlphaEngine:
         start: int = self.train_window
         while start < n_dates:
             train_lo: int = start - self.train_window
-            train_dates = unique_dates[train_lo:start]
-            test_dates = unique_dates[start:start + self.predict_window]
+            train_block: pd.DataFrame = _slice(
+                unique_days[train_lo], unique_days[start - 1]
+            )
+            test_hi: int = min(start + self.predict_window, n_dates) - 1
+            test_block: pd.DataFrame = _slice(unique_days[start], unique_days[test_hi])
 
-            train_block: pd.DataFrame = df[
-                df.index.get_level_values(DATE_LEVEL).isin(train_dates)
-            ]
-            test_block: pd.DataFrame = df[
-                df.index.get_level_values(DATE_LEVEL).isin(test_dates)
-            ]
-
-            if not test_block.empty and not train_block.empty:
+            has_train_labels: bool = bool(train_block[self.target_col].notna().any())
+            if not test_block.empty and has_train_labels:
                 oos_scores.append(self._fit_predict_block(train_block, test_block))
                 n_folds += 1
 
@@ -332,7 +379,9 @@ class TreeAlphaEngine:
                 f"Index names must be ['{DATE_LEVEL}', '{TICKER_LEVEL}'], "
                 f"got {list(features_df.index.names)}."
             )
-        missing_feats = set(FEATURE_COLUMNS) - set(features_df.columns)
+        # The price family is always required; the institutional pair is optional
+        # (absent on price-only intraday panels), so validate the core only.
+        missing_feats = set(PRICE_FEATURE_COLUMNS) - set(features_df.columns)
         if missing_feats:
             raise ValueError(f"features_df missing feature columns: {sorted(missing_feats)}")
 
@@ -392,7 +441,7 @@ if __name__ == "__main__":
     print()
 
     engine = TreeAlphaEngine(
-        target_col="tgt_fwd_logret_1d",
+        target_col=DEFAULT_TARGET,
         model_choice="ensemble",
         train_window=504,
         predict_window=63,
