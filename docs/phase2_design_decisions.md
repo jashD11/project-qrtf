@@ -94,32 +94,38 @@ Tier 3 as a binary gate. **Two limitations that matter now:** (a) all features c
 from one series — no cross-sectional view; (b) fit-on-all-history = **look-ahead in
 the regime labels**.
 
-**Newly possible with the richer data:**
-- Real broad market series (`NIFTY-500`) with 10-yr history.
-- **Market-internal features impossible with one index:** cross-sectional
-  **dispersion** (spread of the 68 stocks' returns), **average pairwise correlation**
-  (spikes in panics — risk-on/off tell), **breadth** (% above MA / advance-decline),
-  plus index **realized vol**, downside semivariance, aggregate turnover.
+**Built: `src/production_ml/tier2_regime.py` (complete).** A causal, market-aware
+walk-forward Gaussian HMM. Verified on real data: COVID (Mar-2020) reads 100% Panic,
+Calm is the majority, a truncation test confirms zero look-ahead, fit+decode ~4s.
 
-**Decisions:**
-- **[RECOMMENDED] Frequency: run the HMM at *daily*** even for intraday strategies —
-  regimes are slow macro backdrops. **Broadcast the daily regime onto intraday bars**
-  (same lagged-broadcast pattern as delivery).
-- **[RECOMMENDED] Causal fitting:** walk-forward / expanding-window refit (fit on
-  trailing data, filter current state forward) to remove the look-ahead, consistent
-  with the tree engine.
-- **[RECOMMENDED] Standardize features** (z-score) before fitting — raw returns
-  (~0.01) and avg correlation (~0.5) are on wildly different scales and the big one
-  would dominate the Gaussian.
-- **[RECOMMENDED] States:** start at **2** (keeps Tier 3 compatible), keep **3**
-  sweepable via `StrategyConfig.hmm_states`. NOTE: Tier 3 currently hard-codes a
-  binary gate (`NotImplementedError` for >2) — >2 states needs execution changes.
-- **[OPEN] Integration with the ML alpha** (pivotal fork):
-  - (a) **Gate** — regime scales the tree book (calm → 130/30, panic →
-    dollar-neutral/cash). Mirrors `dynamic_tilt`; minimal change.
-  - (b) **Feature** — feed regime label / state-probabilities into the trees so they
-    learn regime-conditional alpha. Most ML-native. *Leaning here first.*
-  - (c) **Conditional models** — separate tree ensemble per regime.
+**Decisions (all resolved & implemented):**
+- **[DECIDED] Market series = `NIFTY-50`.** `NIFTY-500` was the intended broad proxy
+  but is only ~58% covered in this dataset (a multi-year gap) — unusable. NIFTY-50
+  (2504 days, full history) is the barometer; NIFTY-100 is the broader fallback.
+- **[DECIDED] 3 inputs on 3 distinct axes** (not "more features" — most stress
+  metrics are collinear): `mkt_ret` (direction), `log_realized_vol` 20d (risk
+  magnitude), `avg_corr` = mean pairwise correlation of the 68 stocks (herding —
+  the one axis a single index can't see). Dispersion / semivariance / breadth
+  dropped as redundant with vol/corr (breadth kept as a possible 4th).
+- **[DONE] Frequency: HMM runs *daily*;** `broadcast_to_intraday()` maps each
+  intraday bar to the prior completed daily regime (t-1), same lagged pattern as
+  delivery — no look-ahead. (Used later by the execution tier.)
+- **[DONE] Causal fitting:** walk-forward refit (`train_days=504`, `refit_every=63`),
+  each block decoded by **forward filtering** (past-only) — not Viterbi / forward-
+  backward, which would leak future within the block.
+- **[DONE] Standardize features** with **expanding, past-only z-score**
+  (`zscore_min_periods=252`) — leak-free and scale-equalizing.
+- **[DONE] States:** default **2** (Calm/Panic), `hmm_states` sweepable to **3**
+  (detector is n-state-generic; variance-ordered remap each refit). NOTE: a 2-state
+  HMM bisects vol (~45% "Panic"); 3 states carve off a smaller top-vol stress state.
+  The *sandbox* Tier 3 still hard-codes a binary gate — the (deferred) *production*
+  execution tier must map states→exposure generically.
+- **[DECIDED] Integration = gate-first, feature-ready.** Regime will size the tree
+  book (calm → lever longs, panic → neutral/cash) — mirrors `dynamic_tilt`. Built
+  causally and emits per-state **posteriors** (`RegimeResult.probs`) so option (b),
+  regime-as-tree-feature, drops in later via a toggle. Option (c) conditional models
+  deferred. This pass ships the detector only; the execution/gate + injection are
+  designed-for but not wired.
 
 ---
 
@@ -143,6 +149,8 @@ the regime labels**.
 ✅ resample_bars.py    15-min → 30/60min/daily  (session-aware, validated)
 ✅ full dataset        68 stocks consolidated + resampled to 4 aligned parquets
 ✅ FREQ_REGISTRY + frequency-aware loader / feature_creator / tier1_trees
-⬜ Tier 2 HMM redesign (per §3)
+✅ Tier 2 HMM redesign — causal market-aware regime detector (tier2_regime.py)
+⬜ PRODUCTION_ML execution/gate tier (masks + regime → weights → returns)
+⬜ Regime-as-tree-feature injection (the "feature" half; posteriors already emitted)
 ⬜ PRODUCTION_ML orchestrator + mask→returns→ledger
 ```
