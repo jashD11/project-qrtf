@@ -83,10 +83,29 @@ class _RFConfig:
 
 
 @dataclass
+class _RegimeConfig:
+    """Tier 2 market-regime HMM (PRODUCTION_ML). See src/production_ml/tier2_regime.py."""
+    # NIFTY-50 = the market proxy: canonical barometer with full continuous
+    # history here (2504 days). NIFTY-500 is only ~58% covered in this dataset
+    # (a multi-year gap), so it is unusable; NIFTY-100 is the broader fallback.
+    market_index: str = "NIFTY-50"
+    index_parquet: str = "data/15min_index.parquet"
+    stock_parquet: str = "data/daily_ohlcv.parquet"
+    vol_window: int = 20                       # realized-vol lookback (trading days)
+    corr_window: int = 20                      # rolling avg-pairwise-corr lookback
+    zscore_min_periods: int = 252              # expanding causal z-score burn-in
+    train_days: int = 504                      # walk-forward fit window (trading days)
+    refit_every: int = 63                      # refit cadence / decode block (trading days)
+    n_iter: int = 200                          # HMM EM iterations
+    random_state: int = 42                     # reproducible fits
+
+
+@dataclass
 class _MLConfig:
     lgbm: _LGBMConfig = field(default_factory=_LGBMConfig)
     xgb: _XGBConfig = field(default_factory=_XGBConfig)
     rf: _RFConfig = field(default_factory=_RFConfig)
+    regime: _RegimeConfig = field(default_factory=_RegimeConfig)
 
 
 ML_CONFIG: _MLConfig = _MLConfig()
