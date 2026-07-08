@@ -62,13 +62,26 @@ strategy sweep's "frequency axis" is real.
 - **[DECIDED] D3 — Resampling:** `resample_bars.py` produces `30/60min/daily` from
   the 15-min source (session-aware; no bin spans the overnight gap). 15-min is the
   source itself.
-- **[RECOMMENDED] Session-boundary targets:** null out forward targets that would
-  span the overnight gap (group targets by `(ticker, date)`); keep *features*
-  spanning the gap (overnight return is real signal).
-- **[OPEN] `FREQ_REGISTRY`** in `config.py`: per-frequency csv/parquet path, approx
-  bars/day (15min≈25, 30min≈13, 60min≈7, daily=1), horizon set, train/predict
-  windows. `StrategyConfig.frequency` (currently only in the hash) becomes the live
-  selector.
+- **[DECIDED] Session-boundary targets:** null out forward targets that would span
+  the overnight gap (target bar must resolve in the same session); keep *features*
+  spanning the gap (overnight return is real signal). **Implemented** in
+  `_compute_targets(null_cross_session=...)`, on only when `bars_per_day > 1`.
+- **[DECIDED] Decoupled target retention (refinement).** The old single
+  `dropna(how="any")` required *both* the 1-bar and 5-bar labels, so the
+  restrictive 5-bar same-session constraint discarded rows valid for the 1-bar
+  label — at 60min it nuked ~72% of rows. Now `create_features` keeps a row if
+  its features are complete **and ≥1 target is defined**, leaving masked (NaN)
+  target cells in place; `tier1_trees` drops the remaining per-target NaNs inside
+  each fold. 60min retention went 319k → 959k rows, `tgt_fwd_logret_1b` fully
+  populated.
+- **[DONE] `FREQ_REGISTRY`** in `config.py`: `_FreqSpec(parquet, bars_per_day,
+  train_days, predict_days, has_institutional)` for 15min/30min/60min/daily.
+  `config.freq_spec()` resolves it. `StrategyConfig.frequency` is the live selector;
+  `data_scraping.load_bars(freq)`, `feature_creator.create_features(df, freq)`, and
+  `TreeAlphaEngine.from_frequency(freq)` all read from it. Feature lookbacks are
+  bar counts (names `_Nb`); walk-forward windows are trading days (loop slides by
+  calendar day via `searchsorted`, not by bar). **Verified end-to-end** on the real
+  parquets (daily + 60min): [-1,+1] bounds hold, decile masks correct, no leakage.
 
 ---
 
@@ -126,11 +139,10 @@ the regime labels**.
 
 ```
 ✅ download_nse.py     gdown puller (rate-limited past ~54; rclone is the real path)
-✅ consolidate.py      per-stock CSVs → one long 15-min Parquet  (+ add stock/index filter)
+✅ consolidate.py      per-stock CSVs → one long 15-min Parquet  (+ stock/index filter)
 ✅ resample_bars.py    15-min → 30/60min/daily  (session-aware, validated)
-⬜ finish download      rclone the remaining files (user action)
-⬜ consolidate + resample the full 68-stock dataset
-⬜ FREQ_REGISTRY + frequency-aware loader / feature_creator / tier1_trees
+✅ full dataset        68 stocks consolidated + resampled to 4 aligned parquets
+✅ FREQ_REGISTRY + frequency-aware loader / feature_creator / tier1_trees
 ⬜ Tier 2 HMM redesign (per §3)
 ⬜ PRODUCTION_ML orchestrator + mask→returns→ledger
 ```

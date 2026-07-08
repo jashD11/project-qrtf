@@ -7,8 +7,57 @@ from typing import Any
 MODE: str = "SANDBOX"
 
 # Paths to historical NSE OHLCV datasets (used in PRODUCTION_ML mode only).
+# Legacy single-file selectors kept for the data_scraping dry-run; the live
+# frequency selector is FREQ_REGISTRY below.
 DATA_DAILY_CSV: str = "data/daily_ohlcv.csv"
 DATA_15MIN_CSV: str = "data/15min_ohlcv.csv"
+
+
+# --------------------------------------------------------------------------- #
+# Frequency registry — the "pick a frequency flag" axis of the strategy sweep.
+#
+# resample_bars.py derives four aligned OHLCV Parquets from the one 15-min
+# source of truth. Each frequency owns a coherent bar series; a single flag
+# (``StrategyConfig.frequency``) selects which one the loader, feature factory,
+# and tree engine consume. See docs/phase2_design_decisions.md §2.
+#
+# Unit convention (design decision D2):
+#   - Feature lookbacks are counted in **bars** (one row of the selected
+#     frequency). The same integer horizons auto-scale per frequency, so warm-up
+#     stays small intraday. Feature names carry a bar-neutral ``_Nb`` suffix.
+#   - Walk-forward train/predict windows are counted in **trading days**, so the
+#     trees always get enough rows regardless of how many bars fall in a day.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class _FreqSpec:
+    parquet: str            # OHLCV Parquet for this frequency
+    bars_per_day: int       # approx bars in one NSE session (09:15–15:30 IST)
+    train_days: int         # walk-forward fit window, in unique trading days
+    predict_days: int       # walk-forward out-of-sample window, in trading days
+    has_institutional: bool # daily delivery joins as-is; intraday = t-1 lagged
+                            # broadcast (D1). False → institutional family dropped.
+
+
+# 15-min is the source itself; 30/60min/daily are session-aware resamples of it.
+# All four share one timeline, so the frequency axis compares like-for-like.
+FREQ_REGISTRY: dict[str, _FreqSpec] = {
+    "15min": _FreqSpec("data/15min_ohlcv.parquet", 25, 504, 63, True),
+    "30min": _FreqSpec("data/30min_ohlcv.parquet", 13, 504, 63, True),
+    "60min": _FreqSpec("data/60min_ohlcv.parquet", 7, 504, 63, True),
+    "daily": _FreqSpec("data/daily_ohlcv.parquet", 1, 504, 63, True),
+}
+
+DEFAULT_FREQUENCY: str = "daily"
+
+
+def freq_spec(frequency: str) -> _FreqSpec:
+    """Look up the _FreqSpec for a frequency flag, with a clear error if unknown."""
+    try:
+        return FREQ_REGISTRY[frequency]
+    except KeyError:
+        raise ValueError(
+            f"frequency={frequency!r} not in FREQ_REGISTRY {sorted(FREQ_REGISTRY)}"
+        ) from None
 
 
 @dataclass

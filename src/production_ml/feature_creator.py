@@ -15,24 +15,54 @@ Design contract
     - Zero look-ahead bias: all rolling/shift features use current-or-past bars
       only. Only the *target* columns look forward (``shift(-1)`` / ``shift(-5)``).
 
+Frequency awareness (design decisions D1/D2)
+    The same factory runs on any bar frequency (15min/30min/60min/daily). All
+    lookback horizons are counted in **bars**, so feature names carry a
+    bar-neutral ``_Nb`` suffix (``mom_logret_20b`` = 20 bars back, whatever the
+    frequency). The ``date`` index level holds each bar's timestamp (a calendar
+    date on daily data, an intraday timestamp otherwise); cross-sectional
+    ranking per that level therefore compares stocks at the same bar.
+
+    Two things flex by frequency:
+      - Institutional family (delivery) is end-of-day only. On daily bars it
+        joins directly; intraday it is a t-1 lagged broadcast (done upstream in
+        augment_dataset). If the columns are absent, the family is dropped and
+        the factory emits 17 features instead of 19.
+      - Forward targets that would span the overnight gap are nulled on intraday
+        frequencies (a target must resolve inside the same session), so the last
+        few bars of each day carry no label. Daily bars never null (crossing to
+        the next day *is* the target).
+
 Feature families (19 features total)
     Momentum & Reversal (10)
-        mom_logret_{1,5,20,60,120,252}d, mom_close_sma{20,50,200},
-        mom_max_dret_20d
+        mom_logret_{1,5,20,60,120,252}b, mom_close_sma{20,50,200},
+        mom_max_dret_20b
     Volatility & Risk (4)
-        vol_realized_{20,60}d, vol_parkinson_20d, vol_drawdown_252d
+        vol_realized_{20,60}b, vol_parkinson_20b, vol_drawdown_252b
     Liquidity, Volume & Institutional (5)
-        liq_amihud, liq_vol_var_20d, liq_turnover_20d,
+        liq_amihud, liq_vol_var_20b, liq_turnover_20b,
         inst_delivery_qty, inst_delivery_pct
 
 Targets (2)
-    tgt_fwd_logret_1d, tgt_fwd_logret_5d
+    tgt_fwd_logret_1b, tgt_fwd_logret_5b
 """
 
+import os
+import sys
 from typing import Final
 
 import numpy as np
 import pandas as pd
+
+# Make the repo root importable so ``import config`` works whether this file is
+# run directly or imported by an orchestrator (mirrors tier1_trees).
+_ROOT: str = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import config
 
 # --- Index level names (must match src/data_scraping.py) ------------------- #
 DATE_LEVEL: Final[str] = "date"
@@ -49,32 +79,57 @@ VOLUME_COL: Final[str] = "volume"
 DELIVERY_QTY_COL: Final[str] = "DeliveryQty"
 DELIVERY_PCT_COL: Final[str] = "DeliveryPct"
 
-# --- Output schema --------------------------------------------------------- #
-FEATURE_COLUMNS: Final[list[str]] = [
+# --- Lookback horizons (counted in BARS — see D2) -------------------------- #
+LOGRET_HORIZONS: Final[tuple[int, ...]] = (1, 5, 20, 60, 120, 252)
+SMA_WINDOWS: Final[tuple[int, ...]] = (20, 50, 200)
+MAXDRET_WINDOW: Final[int] = 20
+VOL_WINDOWS: Final[tuple[int, ...]] = (20, 60)
+PARKINSON_WINDOW: Final[int] = 20
+DRAWDOWN_WINDOW: Final[int] = 252
+VOLVAR_WINDOW: Final[int] = 20
+TURNOVER_WINDOW: Final[int] = 20
+TARGET_HORIZONS: Final[tuple[int, ...]] = (1, 5)
+
+# --- Output schema (names derived from the horizons above) ----------------- #
+# Price-only families (always available, any frequency).
+PRICE_FEATURE_COLUMNS: Final[list[str]] = [
     # Momentum & Reversal
-    "mom_logret_1d",
-    "mom_logret_5d",
-    "mom_logret_20d",
-    "mom_logret_60d",
-    "mom_logret_120d",
-    "mom_logret_252d",
-    "mom_close_sma20",
-    "mom_close_sma50",
-    "mom_close_sma200",
-    "mom_max_dret_20d",
+    *[f"mom_logret_{h}b" for h in LOGRET_HORIZONS],
+    *[f"mom_close_sma{w}" for w in SMA_WINDOWS],
+    f"mom_max_dret_{MAXDRET_WINDOW}b",
     # Volatility & Risk
-    "vol_realized_20d",
-    "vol_realized_60d",
-    "vol_parkinson_20d",
-    "vol_drawdown_252d",
-    # Liquidity, Volume & Institutional
+    *[f"vol_realized_{w}b" for w in VOL_WINDOWS],
+    f"vol_parkinson_{PARKINSON_WINDOW}b",
+    f"vol_drawdown_{DRAWDOWN_WINDOW}b",
+    # Liquidity & Volume
     "liq_amihud",
-    "liq_vol_var_20d",
-    "liq_turnover_20d",
+    f"liq_vol_var_{VOLVAR_WINDOW}b",
+    f"liq_turnover_{TURNOVER_WINDOW}b",
+]
+# End-of-day institutional family (daily direct / intraday t-1 lagged broadcast).
+INSTITUTIONAL_FEATURE_COLUMNS: Final[list[str]] = [
     "inst_delivery_qty",
     "inst_delivery_pct",
 ]
-TARGET_COLUMNS: Final[list[str]] = ["tgt_fwd_logret_1d", "tgt_fwd_logret_5d"]
+# Full 19-feature schema. ``feature_columns(with_institutional=False)`` drops the
+# trailing two when delivery data is unavailable for the chosen frequency.
+FEATURE_COLUMNS: Final[list[str]] = PRICE_FEATURE_COLUMNS + INSTITUTIONAL_FEATURE_COLUMNS
+TARGET_COLUMNS: Final[list[str]] = [f"tgt_fwd_logret_{h}b" for h in TARGET_HORIZONS]
+
+
+def feature_columns(with_institutional: bool = True) -> list[str]:
+    """The feature schema for a run: all 19, or 17 when delivery is unavailable."""
+    return (
+        PRICE_FEATURE_COLUMNS + INSTITUTIONAL_FEATURE_COLUMNS
+        if with_institutional
+        else list(PRICE_FEATURE_COLUMNS)
+    )
+
+
+def present_feature_columns(df: pd.DataFrame) -> list[str]:
+    """The subset of the feature schema actually present as columns on ``df``."""
+    return [c for c in FEATURE_COLUMNS if c in df.columns]
+
 
 _PARKINSON_K: Final[float] = 1.0 / (4.0 * np.log(2.0))  # Parkinson variance scalar
 
@@ -107,60 +162,68 @@ def _roll(s: pd.Series, window: int, op: str) -> pd.Series:
 # --------------------------------------------------------------------------- #
 # Feature computation
 # --------------------------------------------------------------------------- #
-def _compute_raw_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute the raw (un-normalized) feature panel from the augmented frame."""
+def _compute_raw_features(df: pd.DataFrame, with_institutional: bool) -> pd.DataFrame:
+    """
+    Compute the raw (un-normalized) feature panel from the augmented frame.
+
+    All windows are trailing bar counts, so this is frequency-agnostic. The
+    institutional family is appended only when ``with_institutional`` and its
+    columns are present.
+    """
     close = df[CLOSE_COL]
     high = df[HIGH_COL]
     low = df[LOW_COL]
     volume = df[VOLUME_COL]
 
-    # Daily log return is the atomic building block for several families.
-    daily_logret = np.log(close / _shift(close, 1))
+    # Per-bar log return is the atomic building block for several families.
+    bar_logret = np.log(close / _shift(close, 1))
 
     feats = pd.DataFrame(index=df.index)
 
     # ---- Momentum & Reversal ---------------------------------------------- #
-    # Multi-horizon cumulative log returns: log(C_t / C_{t-n}).
-    for horizon in (1, 5, 20, 60, 120, 252):
-        feats[f"mom_logret_{horizon}d"] = np.log(close / _shift(close, horizon))
+    # Multi-horizon cumulative log returns: log(C_t / C_{t-n}), n in bars.
+    for h in LOGRET_HORIZONS:
+        feats[f"mom_logret_{h}b"] = np.log(close / _shift(close, h))
 
     # Distance of price from its own trailing simple moving averages.
-    feats["mom_close_sma20"] = close / _roll(close, 20, "mean")
-    feats["mom_close_sma50"] = close / _roll(close, 50, "mean")
-    feats["mom_close_sma200"] = close / _roll(close, 200, "mean")
+    for w in SMA_WINDOWS:
+        feats[f"mom_close_sma{w}"] = close / _roll(close, w, "mean")
 
-    # MAX proxy: largest single-day return over the trailing month (lottery/reversal).
-    feats["mom_max_dret_20d"] = _roll(daily_logret, 20, "max")
+    # MAX proxy: largest single-bar return over the trailing window (lottery/reversal).
+    feats[f"mom_max_dret_{MAXDRET_WINDOW}b"] = _roll(bar_logret, MAXDRET_WINDOW, "max")
 
     # ---- Volatility & Risk ------------------------------------------------ #
-    # Realized volatility = rolling std of daily log returns.
-    feats["vol_realized_20d"] = _roll(daily_logret, 20, "std")
-    feats["vol_realized_60d"] = _roll(daily_logret, 60, "std")
+    # Realized volatility = rolling std of per-bar log returns.
+    for w in VOL_WINDOWS:
+        feats[f"vol_realized_{w}b"] = _roll(bar_logret, w, "std")
 
     # Parkinson high-low volatility: sqrt( k * mean( ln(H/L)^2 ) ), k = 1/(4 ln2).
     hl_sq = np.square(np.log(high / low))
-    feats["vol_parkinson_20d"] = np.sqrt(_PARKINSON_K * _roll(hl_sq, 20, "mean"))
+    feats[f"vol_parkinson_{PARKINSON_WINDOW}b"] = np.sqrt(
+        _PARKINSON_K * _roll(hl_sq, PARKINSON_WINDOW, "mean")
+    )
 
-    # Trailing 252-day peak drawdown: current close vs. rolling one-year high.
-    peak_252 = _roll(close, 252, "max")
-    feats["vol_drawdown_252d"] = (close / peak_252) - 1.0
+    # Trailing peak drawdown: current close vs. rolling window high.
+    peak = _roll(close, DRAWDOWN_WINDOW, "max")
+    feats[f"vol_drawdown_{DRAWDOWN_WINDOW}b"] = (close / peak) - 1.0
 
-    # ---- Liquidity, Volume & Institutional -------------------------------- #
+    # ---- Liquidity & Volume ----------------------------------------------- #
     # Amihud illiquidity: |return| / (Close * Volume).
-    feats["liq_amihud"] = daily_logret.abs() / (close * volume)
+    feats["liq_amihud"] = bar_logret.abs() / (close * volume)
 
-    # 20-day volume variance and turnover vs. its own trailing average.
-    feats["liq_vol_var_20d"] = _roll(volume, 20, "var")
-    feats["liq_turnover_20d"] = volume / _roll(volume, 20, "mean")
+    # Rolling volume variance and turnover vs. its own trailing average.
+    feats[f"liq_vol_var_{VOLVAR_WINDOW}b"] = _roll(volume, VOLVAR_WINDOW, "var")
+    feats[f"liq_turnover_{TURNOVER_WINDOW}b"] = volume / _roll(volume, TURNOVER_WINDOW, "mean")
 
-    # Institutional delivery metrics carried straight from the augmented frame.
-    feats["inst_delivery_qty"] = df[DELIVERY_QTY_COL]
-    feats["inst_delivery_pct"] = df[DELIVERY_PCT_COL]
+    # ---- Institutional (optional) ----------------------------------------- #
+    if with_institutional:
+        feats["inst_delivery_qty"] = df[DELIVERY_QTY_COL]
+        feats["inst_delivery_pct"] = df[DELIVERY_PCT_COL]
 
     # Guard against divide-by-zero / log blowups before normalization so that
     # infinities cannot dominate the cross-sectional ranking.
     feats = feats.replace([np.inf, -np.inf], np.nan)
-    return feats[FEATURE_COLUMNS]
+    return feats[feature_columns(with_institutional)]
 
 
 def _rank_normalize(feats: pd.DataFrame) -> pd.DataFrame:
@@ -187,52 +250,101 @@ def _rank_normalize(feats: pd.DataFrame) -> pd.DataFrame:
     return normed.mask(single, 0.0)
 
 
-def _compute_targets(df: pd.DataFrame) -> pd.DataFrame:
-    """Forward 1-day and 5-day log returns (labels only — never fed as features)."""
+def _compute_targets(df: pd.DataFrame, null_cross_session: bool) -> pd.DataFrame:
+    """
+    Forward log-return labels over ``TARGET_HORIZONS`` bars (never fed as features).
+
+    When ``null_cross_session`` (intraday frequencies), a target that would span
+    the overnight gap is nulled: the forward bar must fall on the same calendar
+    date as the current bar, else the label is dropped. On daily bars this is
+    off — the forward bar is by definition the next session, which is the target.
+    """
     close = df[CLOSE_COL]
     targets = pd.DataFrame(index=df.index)
-    targets["tgt_fwd_logret_1d"] = np.log(_shift(close, -1) / close)
-    targets["tgt_fwd_logret_5d"] = np.log(_shift(close, -5) / close)
+
+    # Calendar date of each bar, aligned to the index for per-ticker shifting.
+    cal = pd.Series(
+        pd.DatetimeIndex(df.index.get_level_values(DATE_LEVEL)).normalize(),
+        index=df.index,
+    )
+
+    for h in TARGET_HORIZONS:
+        tgt = np.log(_shift(close, -h) / close)
+        if null_cross_session:
+            fwd_cal = _shift(cal, -h)
+            # Keep only labels whose forward bar resolves inside the same session.
+            tgt = tgt.where(fwd_cal == cal)
+        targets[f"tgt_fwd_logret_{h}b"] = tgt
+
     return targets.replace([np.inf, -np.inf], np.nan)
 
 
-def create_features(augmented_df: pd.DataFrame) -> pd.DataFrame:
+def create_features(
+    augmented_df: pd.DataFrame, frequency: str = config.DEFAULT_FREQUENCY
+) -> pd.DataFrame:
     """
-    Build the normalized feature matrix + forward-return targets.
+    Build the normalized feature matrix + forward-return targets for one frequency.
 
     Args:
-        augmented_df: MultiIndex ('date', 'ticker') daily frame with OHLCV plus
-            DeliveryQty / DeliveryPct, as returned by src/data_scraping.py.
+        augmented_df: MultiIndex ('date', 'ticker') bar frame with OHLCV, and —
+            for the full 19-feature schema — DeliveryQty / DeliveryPct. The
+            ``date`` level holds each bar's timestamp (calendar date on daily
+            data, intraday timestamp otherwise).
+        frequency:    a key in ``config.FREQ_REGISTRY``. Determines whether the
+            institutional family is expected and whether forward targets are
+            nulled at session boundaries (intraday only).
 
     Returns:
-        MultiIndex ('date', 'ticker') DataFrame with the 19 [-1, +1] feature
-        columns followed by the 2 target columns. Rows with NaN/inf features or
-        NaN forward labels (early-history warm-up and the trailing target window)
-        are dropped, so every returned row is fully populated and leakage-free.
+        MultiIndex ('date', 'ticker') DataFrame with the feature columns (19, or
+        17 when delivery is unavailable) followed by the target columns. Rows
+        with NaN/inf features or NaN forward labels (warm-up, undefined or
+        cross-session labels) are dropped, so every returned row is fully
+        populated and leakage-free.
     """
     if not isinstance(augmented_df.index, pd.MultiIndex):
         raise ValueError("augmented_df must have a MultiIndex ('date', 'ticker')")
 
+    spec = config.freq_spec(frequency)
+    have_delivery = {DELIVERY_QTY_COL, DELIVERY_PCT_COL} <= set(augmented_df.columns)
+    with_institutional = spec.has_institutional and have_delivery
+    null_cross_session = spec.bars_per_day > 1  # only intraday spans the gap
+
+    if spec.has_institutional and not have_delivery:
+        print(
+            "[feature_creator] delivery columns absent — emitting price-only "
+            f"({len(PRICE_FEATURE_COLUMNS)}) features."
+        )
+
     # Sort so per-ticker rolling windows are chronologically ordered.
     df = augmented_df.sort_index()
 
-    raw = _compute_raw_features(df)
+    raw = _compute_raw_features(df, with_institutional)
     normed = _rank_normalize(raw)
-    targets = _compute_targets(df)
+    targets = _compute_targets(df, null_cross_session)
 
     out = pd.concat([normed, targets], axis=1)
+    feat_cols = feature_columns(with_institutional)
 
     before = len(out)
-    # Single dropna removes warm-up NaNs (features), inf-derived NaNs, and the
-    # trailing rows whose forward labels are undefined.
-    out = out.dropna(how="any")
+    # Require every feature (drops warm-up / inf-derived NaNs) and at least one
+    # valid target. The two targets are decoupled on purpose: a row valid for the
+    # 1-bar label is kept even if its 5-bar label is undefined (undefined for the
+    # trailing bars, and — intraday — for labels that would span the overnight
+    # gap). tier1_trees drops the remaining per-target NaNs inside each fold, so
+    # the restrictive long-horizon label never discards short-horizon training
+    # rows. Any surviving target NaN is left in place as a masked (untradeable) cell.
+    feat_ok = out[feat_cols].notna().all(axis=1)
+    tgt_ok = out[TARGET_COLUMNS].notna().any(axis=1)
+    out = out[feat_ok & tgt_ok]
     after = len(out)
 
+    tgt_nan = {c: int(out[c].isna().sum()) for c in TARGET_COLUMNS}
     print(
-        f"[feature_creator] Features: {len(FEATURE_COLUMNS)} | "
-        f"targets: {len(TARGET_COLUMNS)} | "
-        f"rows {before} -> {after} after dropna "
-        f"({before - after} warm-up/label rows removed)"
+        f"[feature_creator] freq={frequency} | "
+        f"features: {len(feat_cols)} | "
+        f"targets: {len(TARGET_COLUMNS)} | cross-session-null={null_cross_session} | "
+        f"rows {before} -> {after} ({before - after} warm-up/no-label rows removed) | "
+        f"per-target NaN kept: {tgt_nan}"
     )
     return out
 
@@ -318,12 +430,16 @@ if __name__ == "__main__":
     feat_max = matrix[FEATURE_COLUMNS].max().max()
     tol = 1e-9
     in_bounds = (feat_min >= -1.0 - tol) and (feat_max <= 1.0 + tol)
-    no_nan = not matrix.isna().any().any()
+    # Features must be fully populated; targets may carry masked (NaN) cells for
+    # trailing / cross-session bars, so they are checked separately.
+    no_feat_nan = not matrix[FEATURE_COLUMNS].isna().any().any()
+    tgt_nan = {c: int(matrix[c].isna().sum()) for c in TARGET_COLUMNS}
 
     print()
     print("=" * 70)
     print(f"  feature global min : {feat_min:+.6f}")
     print(f"  feature global max : {feat_max:+.6f}")
     print(f"  [-1, +1] bounds    : {'PASS' if in_bounds else 'FAIL'}")
-    print(f"  no NaN/leak rows   : {'PASS' if no_nan else 'FAIL'}")
+    print(f"  no NaN feature rows: {'PASS' if no_feat_nan else 'FAIL'}")
+    print(f"  target NaN (masked): {tgt_nan}")
     print("=" * 70)

@@ -13,17 +13,33 @@ Expected local CSV schemas
 """
 
 import io
+import os
+import sys
 from datetime import date, timedelta
 from typing import Tuple
 
 import pandas as pd
 
+# Make the repo root importable whether run directly or by an orchestrator.
+_ROOT: str = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import config
+
+# --- Index level names (must match feature_creator) ------------------------ #
+DATE_LEVEL: str = "date"
+TICKER_LEVEL: str = "ticker"
 
 # --- Column name constants for local CSVs ---------------------------------- #
 _DAILY_DATE_COL: str = "date"
 _DAILY_TICKER_COL: str = "ticker"
 _15MIN_DATETIME_COL: str = "datetime"
+
+# --- Consolidated-Parquet schema (from consolidate.py / resample_bars.py) --- #
+_BAR_TIMESTAMP_COL: str = "timestamp"
 
 # --- Full bhavcopy CSV column names (NSE sec_bhavdata_full_*.csv) ---------- #
 _BHAV_SYMBOL_COL: str = "SYMBOL"
@@ -80,6 +96,38 @@ def load_local_csv_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
         f"bars={len(intraday_df)}"
     )
     return daily_df, intraday_df
+
+
+def load_bars(frequency: str = config.DEFAULT_FREQUENCY) -> pd.DataFrame:
+    """
+    Load one frequency's OHLCV bar Parquet as a ('date', 'ticker') MultiIndex.
+
+    The frequency flag selects a Parquet from ``config.FREQ_REGISTRY`` (all four
+    derived from the one 15-min source of truth). The consolidated Parquet's
+    ``timestamp`` column becomes the ``date`` index level — holding a calendar
+    date on daily bars, an intraday bar timestamp otherwise — so the same
+    downstream feature factory and tree engine consume any frequency unchanged.
+
+    Args:
+        frequency: a key in ``config.FREQ_REGISTRY`` ("15min"/"30min"/"60min"/"daily").
+
+    Returns:
+        MultiIndex ('date', 'ticker') DataFrame with OHLCV columns, sorted.
+    """
+    spec = config.freq_spec(frequency)
+    bars: pd.DataFrame = pd.read_parquet(spec.parquet)
+    bars = (
+        bars.rename(columns={_BAR_TIMESTAMP_COL: DATE_LEVEL})
+        .set_index([DATE_LEVEL, TICKER_LEVEL])
+        .sort_index()
+    )
+    n_days = bars.index.get_level_values(DATE_LEVEL).normalize().nunique()
+    print(
+        f"[data_scraping] load_bars({frequency}) : {bars.shape} | "
+        f"bars={len(bars)} | days={n_days} | "
+        f"tickers={bars.index.get_level_values(TICKER_LEVEL).nunique()}"
+    )
+    return bars
 
 
 def scrape_nse_delivery_data(start_date: date, end_date: date) -> pd.DataFrame:
@@ -153,44 +201,76 @@ def scrape_nse_delivery_data(start_date: date, end_date: date) -> pd.DataFrame:
 
 
 def augment_dataset(
-    daily_df: pd.DataFrame,
+    bars_df: pd.DataFrame,
     delivery_df: pd.DataFrame,
+    frequency: str = config.DEFAULT_FREQUENCY,
 ) -> pd.DataFrame:
     """
-    Merges DeliveryQty and DeliveryPct into the local daily price DataFrame
-    via a MultiIndex left-join on ('date', 'ticker').
+    Merge DeliveryQty / DeliveryPct into a bar DataFrame, frequency-aware (D1).
 
-    Gap-filling strategy:
-      - Forward-fill within each ticker across dates to bridge weekends and
-        NSE holidays where no bhavcopy is available.
-      - Any leading NaNs (ticker appears in daily_df before delivery data
-        begins) are filled with 0.0 to avoid polluting downstream features.
+    Delivery is an end-of-day bhavcopy quantity with no intraday analog, so:
+      - **Daily bars** (``bars_per_day == 1``): direct join on ('date', 'ticker').
+        Day d's delivery pairs with day d's close — both known at EOD d, so no
+        look-ahead. Forward-fill within ticker to bridge holidays/gaps.
+      - **Intraday bars**: broadcast the **prior trading day's** (t-1) delivery
+        as a within-day constant across every bar of day t. The 1-day lag avoids
+        seeing an EOD quantity mid-session.
+
+    Leading NaNs (ticker present before delivery history begins) are zero-filled.
 
     Args:
-        daily_df:    MultiIndex ('date', 'ticker') DataFrame from load_local_csv_data.
-        delivery_df: MultiIndex ('date', 'ticker') DataFrame from scrape_nse_delivery_data.
+        bars_df:     MultiIndex ('date', 'ticker') frame from ``load_bars``.
+        delivery_df: MultiIndex ('date', 'ticker') daily delivery from
+                     ``scrape_nse_delivery_data`` (empty is allowed).
+        frequency:   a key in ``config.FREQ_REGISTRY``; selects the lag path.
 
     Returns:
-        Augmented copy of daily_df with DeliveryQty and DeliveryPct appended.
+        Copy of ``bars_df`` with DeliveryQty and DeliveryPct appended. If
+        ``delivery_df`` is empty the frame is returned unchanged (the feature
+        factory then emits the price-only schema).
     """
     delivery_cols: list[str] = [DELIVERY_QTY_COL, DELIVERY_PCT_COL]
 
-    augmented: pd.DataFrame = daily_df.join(delivery_df[delivery_cols], how="left")
+    if delivery_df is None or delivery_df.empty:
+        print("[data_scraping] No delivery data — returning bars unaugmented.")
+        return bars_df
 
-    # Forward-fill within each ticker group to propagate last known delivery
-    # values across days where the bhavcopy was unavailable (holidays, gaps).
+    spec = config.freq_spec(frequency)
+    intraday: bool = spec.bars_per_day > 1
+
+    # Daily delivery table, forward-filled within ticker to bridge gaps, and
+    # (intraday) lagged one trading day so no bar sees same-day EOD delivery.
+    deliv: pd.DataFrame = delivery_df[delivery_cols].sort_index()
+    if intraday:
+        deliv = deliv.groupby(level=TICKER_LEVEL).shift(1)  # t-1 broadcast
+
+    if not intraday:
+        # Daily fast path: exact ('date', 'ticker') join.
+        augmented: pd.DataFrame = bars_df.join(deliv, how="left")
+    else:
+        # Intraday: join the daily (lagged) table onto each bar by calendar day.
+        cal_day = pd.DatetimeIndex(
+            bars_df.index.get_level_values(DATE_LEVEL)
+        ).normalize()
+        left = bars_df.reset_index()
+        left["_cal_day"] = cal_day
+        right = deliv.reset_index().rename(columns={DATE_LEVEL: "_cal_day"})
+        merged = left.merge(
+            right, on=["_cal_day", TICKER_LEVEL], how="left"
+        ).drop(columns="_cal_day")
+        augmented = merged.set_index([DATE_LEVEL, TICKER_LEVEL]).sort_index()
+
+    # Forward-fill within ticker (bridges holidays/gaps), then zero the leading
+    # rows that precede this ticker's first delivery observation.
     for col in delivery_cols:
         augmented[col] = (
-            augmented[col]
-            .groupby(level="ticker")
-            .ffill()
-            .fillna(0.0)     # leading rows before first bhavcopy → zero
+            augmented[col].groupby(level=TICKER_LEVEL).ffill().fillna(0.0)
         )
 
     nan_remaining: int = int(augmented[delivery_cols].isna().sum().sum())
     print(
-        f"[data_scraping] Augmented : {augmented.shape} | "
-        f"NaNs remaining after fill: {nan_remaining}"
+        f"[data_scraping] Augmented ({frequency}, lag={'t-1' if intraday else 't'}) : "
+        f"{augmented.shape} | NaNs remaining after fill: {nan_remaining}"
     )
     return augmented
 
