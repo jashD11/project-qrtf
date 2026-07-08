@@ -46,14 +46,18 @@ import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor
 
 # Make the repo root importable whether this file is run as ``python
-# src/tier1_trees.py`` (sys.path[0] == src/) or as ``python -m src.tier1_trees``
-# / imported by run_pipeline.py from the repo root.
-_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# src/production_ml/tier1_trees.py`` (sys.path[0] == src/production_ml/) or as
+# ``python -m src.production_ml.tier1_trees`` / imported by an orchestrator from
+# the repo root. __file__ is src/production_ml/tier1_trees.py, so the repo root
+# is three directories up.
+_ROOT: str = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import config
-from src.feature_creator import (
+from src.production_ml.feature_creator import (
     DATE_LEVEL,
     TICKER_LEVEL,
     FEATURE_COLUMNS,
