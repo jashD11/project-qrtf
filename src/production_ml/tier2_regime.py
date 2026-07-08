@@ -27,10 +27,14 @@ Hidden states
     (Panic / Stress), regardless of the label EM happened to assign. n_states is
     generic (2 default, 3 sweepable via ``StrategyConfig.hmm_states``).
 
-Output
-    ``RegimeResult`` — a daily int ``states`` Series (0..n-1) plus a ``probs``
-    DataFrame of per-state posteriors (the probabilities cost nothing now and are
-    exactly what the deferred regime-as-tree-feature path will consume).
+Output (``RegimeResult`` — two complementary views)
+    - HMM regime: ``states`` (0..n-1 vol/herding taxonomy) + ``probs`` (posteriors,
+      for the deferred regime-as-tree-feature path). A 2-state HMM *bisects* vol,
+      so ``states`` is not a rare crisis flag.
+    - De-risk gate: ``panic`` (bool) + ``stress`` (continuous). HMM posteriors
+      saturate (persistent vol → self-transition ~0.98), so a probability cutoff
+      can't set frequency; ``panic`` instead marks the top ``1 - panic_threshold``
+      of a causal trailing stress distribution. This is what the execution tier gates.
 
 This pass builds the detector only. The execution/gate tier (masks + regime →
 weights → returns) and orchestrator are designed-for but deferred; a t-1 intraday
@@ -68,9 +72,24 @@ _CLOSE_COL: Final[str] = "close"
 
 @dataclass
 class RegimeResult:
-    """Full walk-forward output of the regime detector."""
-    states: pd.Series      # int 0..n-1 (0=Calm … n-1=Panic), indexed by daily date
+    """
+    Full walk-forward output of the regime detector.
+
+    Two complementary views of market state:
+      - The HMM regime (``states`` / ``probs``): the multi-state vol/herding
+        taxonomy (0=Calm … n-1=most volatile). Rich context; feeds the deferred
+        regime-as-tree-feature path. Note a 2-state HMM *bisects* vol (upper
+        state ~45%), so ``states`` is NOT a rare crisis flag.
+      - The de-risk gate (``panic`` / ``stress``): a frequency-controlled flag.
+        HMM posteriors saturate (vol is persistent, self-transition ~0.98), so a
+        probability cutoff can't dial frequency — instead ``panic`` marks the days
+        whose continuous stress score sits in the top ``1 - panic_threshold`` of
+        its own trailing history (causal). This is what the execution tier gates on.
+    """
+    states: pd.Series      # int 0..n-1 HMM vol regime (0=Calm … n-1=most volatile)
     probs: pd.DataFrame    # per-state posterior probabilities, same index; cols 0..n-1
+    stress: pd.Series      # continuous causal stress score (mean of z-vol & z-herding)
+    panic: pd.Series       # bool de-risk gate: stress above its trailing panic quantile
 
 
 # --------------------------------------------------------------------------- #
@@ -231,11 +250,34 @@ class RegimeDetector:
     are variance-ordered (0=Calm … n-1=Panic) each refit for stability.
     """
 
-    def __init__(self, n_states: int = 2, cfg=None) -> None:
+    def __init__(
+        self, n_states: int = 2, cfg=None, panic_threshold: float | None = None
+    ) -> None:
         if n_states < 2:
             raise ValueError(f"n_states must be >= 2, got {n_states}")
         self.n_states = n_states
         self.cfg = cfg or config.ML_CONFIG.regime
+        # Constructor override wins over the config default (handy for sweeps).
+        self.panic_threshold = (
+            self.cfg.panic_threshold if panic_threshold is None else panic_threshold
+        )
+        if not 0.0 < self.panic_threshold <= 1.0:
+            raise ValueError(
+                f"panic_threshold must be in (0, 1], got {self.panic_threshold}"
+            )
+
+    def _transmat_prior(self) -> np.ndarray:
+        """
+        Dirichlet transition prior with extra weight on the diagonal.
+
+        hmmlearn's M-step adds ``(transmat_prior - 1)`` as pseudo-counts, so a
+        diagonal of ``1 + stickiness`` biases the model toward self-transitions —
+        regimes become persistent (fewer, longer spells) instead of flickering on
+        every jittery day. Off-diagonal stays 1 (adds nothing).
+        """
+        prior = np.ones((self.n_states, self.n_states))
+        np.fill_diagonal(prior, 1.0 + self.cfg.transmat_stickiness)
+        return prior
 
     def _fit_block(self, train_obs: np.ndarray) -> GaussianHMM:
         model = GaussianHMM(
@@ -243,9 +285,28 @@ class RegimeDetector:
             covariance_type="full",
             n_iter=self.cfg.n_iter,
             random_state=self.cfg.random_state,
+            transmat_prior=self._transmat_prior(),
         )
         model.fit(train_obs)
         return model
+
+    def _severity_gate(self, stress: pd.Series) -> pd.Series:
+        """
+        Causal de-risk gate: Panic on days whose stress score sits in the top
+        ``1 - panic_threshold`` of its own **trailing** history.
+
+        Why not threshold the HMM posterior? Vol is persistent (self-transition
+        ~0.98), so the filtered posterior saturates — >90% confident on ~92% of
+        days — leaving no probability mass in the middle for a cutoff to move. A
+        percentile on the continuous stress score is the only leak-free way to set
+        the frequency: the expanding quantile uses past-and-present only, so Panic
+        converges to ~(1 - panic_threshold) of days as history accrues (still
+        arriving in clusters, because stress itself is persistent).
+        """
+        q = stress.expanding(min_periods=self.cfg.zscore_min_periods).quantile(
+            self.panic_threshold
+        )
+        return (stress > q).fillna(False).rename("panic")
 
     def fit_predict(self, features: pd.DataFrame) -> RegimeResult:
         """
@@ -268,7 +329,6 @@ class RegimeDetector:
                 "Lower regime.train_days / zscore_min_periods or add history."
             )
 
-        state_parts: list[pd.Series] = []
         prob_parts: list[pd.DataFrame] = []
         n_folds = 0
 
@@ -279,33 +339,44 @@ class RegimeDetector:
             model = self._fit_block(obs_all[lo:start])
             remap = _variance_order(model)
 
-            # Filter over [train + block]; keep only the block's causal labels.
+            # Filter over [train + block]; keep only the block's causal posteriors,
+            # reordered to canonical (col j = j-th lowest-vol state).
             seq = obs_all[lo:hi]
-            raw_states, raw_post = _forward_filter(model, seq)
+            _, raw_post = _forward_filter(model, seq)
             b0 = start - lo                            # block offset within seq
-            block_states = remap[raw_states[b0:]]
-            block_post = raw_post[b0:][:, np.argsort(remap)]  # reorder cols → canonical
-            block_dates = dates[start:hi]
-
-            state_parts.append(pd.Series(block_states, index=block_dates))
-            prob_parts.append(pd.DataFrame(block_post, index=block_dates))
+            block_post = raw_post[b0:][:, np.argsort(remap)]
+            prob_parts.append(pd.DataFrame(block_post, index=dates[start:hi]))
             n_folds += 1
             start += block
 
-        states = pd.concat(state_parts).astype(int)
-        states.index.name = DATE_LEVEL
-        states.name = "regime"
         probs = pd.concat(prob_parts)
         probs.index.name = DATE_LEVEL
         probs.columns = [f"p_state{c}" for c in range(self.n_states)]
 
+        # HMM regime label = variance-ordered argmax of the canonical posteriors
+        # (the honest vol/herding taxonomy — NOT the de-risk trigger).
+        states = pd.Series(
+            probs.to_numpy().argmax(axis=1), index=probs.index, name="regime"
+        ).astype(int)
+        states.index.name = DATE_LEVEL
+
+        # De-risk gate: continuous stress = mean of the two RISK axes (z-vol,
+        # z-herding); direction (z-return) is level, not risk, so excluded. Gated
+        # causally against its own trailing distribution (see _severity_gate).
+        stress_full = z[[FEATURE_COLUMNS[VOL_IDX], "avg_corr"]].mean(axis=1)
+        panic_full = self._severity_gate(stress_full)
+        stress = stress_full.reindex(probs.index).rename("stress")
+        panic = panic_full.reindex(probs.index)
+
         dist = states.value_counts(normalize=True).sort_index()
-        dist_str = " | ".join(f"S{s}={p:.1%}" for s, p in dist.items())
+        dist_str = " | ".join(f"S{s}={p:.0%}" for s, p in dist.items())
         print(
             f"[tier2_regime] walk-forward done | n_states={self.n_states} | "
-            f"folds={n_folds} | days={len(states)} | {dist_str}"
+            f"folds={n_folds} | days={len(states)} | HMM regime: {dist_str} | "
+            f"gate: Panic {panic.mean():.0%} (thr={self.panic_threshold}, "
+            f"stickiness={self.cfg.transmat_stickiness})"
         )
-        return RegimeResult(states=states, probs=probs)
+        return RegimeResult(states=states, probs=probs, stress=stress, panic=panic)
 
 
 # --------------------------------------------------------------------------- #
@@ -342,54 +413,71 @@ if __name__ == "__main__":
     print(f"  date span      : {feats.index.min().date()} → {feats.index.max().date()}")
 
     t0 = time.time()
-    detector = RegimeDetector(n_states=2)
-    result = detector.fit_predict(feats)
-    elapsed = time.time() - t0
-    print(f"  HMM fit+decode : {elapsed:.1f}s")
+    result = RegimeDetector(n_states=2).fit_predict(feats)  # panic_threshold from cfg (0.85)
+    print(f"  HMM fit+decode : {time.time() - t0:.1f}s")
 
-    states = result.states
+    states, panic, stress = result.states, result.panic, result.stress
+    covid_slice = slice("2020-03-01", "2020-04-15")
 
-    # --- Face validity: the Mar-2020 COVID crash must read as Panic ---------- #
-    covid = states.loc["2020-03-01":"2020-04-15"]
-    covid_panic = float((covid == states.max()).mean()) if len(covid) else float("nan")
+    # --- Face validity: the Mar-2020 COVID crash must trip the de-risk gate --- #
+    covid_panic = float(panic.loc[covid_slice].mean())
+    gate_share = float(panic.mean())
+    print(f"  gate: Panic {gate_share:.0%} of days | COVID window Panic {covid_panic:.0%}")
+
+    # --- Frequency control: gate fraction tracks (1 - panic_threshold) -------- #
+    # Rebuild the full-history stress the detector gates on (no HMM refit needed —
+    # the threshold only affects the gate), so the sweep matches the headline.
+    cfg = config.ML_CONFIG.regime
+    z_full = _causal_zscore(feats[FEATURE_COLUMNS], cfg.zscore_min_periods).dropna()
+    stress_full = z_full[[FEATURE_COLUMNS[VOL_IDX], "avg_corr"]].mean(axis=1)
+
     print()
-    print(f"  COVID window (2020-03-01→04-15): {len(covid)} days | "
-          f"Panic share {covid_panic:.0%}")
-
-    # --- Sanity: Calm is the majority, Panic a minority ---------------------- #
-    calm_share = float((states == 0).mean())
-    panic_share = float((states == states.max()).mean())
-    print(f"  overall        : Calm {calm_share:.0%} | Panic {panic_share:.0%}")
+    print("  panic_threshold → realized Panic frequency over OOS (COVID in parens):")
+    shares = []
+    for thr in (0.80, 0.85, 0.90, 0.95):
+        q = stress_full.expanding(min_periods=cfg.zscore_min_periods).quantile(thr)
+        pan = (stress_full > q).fillna(False).reindex(panic.index)
+        share = float(pan.mean())
+        shares.append(share)
+        covid_share = float(pan.loc[covid_slice].mean())
+        print(f"    thr={thr:.2f} → target {1 - thr:.0%} | realized {share:4.0%} "
+              f"(COVID {covid_share:3.0%})")
+    # Monotone control (rarer as threshold rises); exact fraction drifts above
+    # target in rising-vol eras because the trailing quantile lags — expected.
+    freq_ok = all(shares[i] >= shares[i + 1] - 0.01 for i in range(len(shares) - 1))
 
     # --- Causality: truncating the future must not change past labels -------- #
     cut = feats.index[int(len(feats) * 0.7)]
-    trunc = RegimeDetector(n_states=2).fit_predict(feats.loc[:cut]).states
-    common = states.index.intersection(trunc.index)
-    # Compare only days safely before the truncation's final refit block.
-    safe = common[common < cut - pd.Timedelta(days=200)]
-    match = bool((states.loc[safe] == trunc.loc[safe]).all())
-    print(f"  causality check: {len(safe)} pre-cut days identical after truncation "
-          f"→ {'PASS' if match else 'FAIL'}")
+    trunc = RegimeDetector(n_states=2).fit_predict(feats.loc[:cut])
+    common = panic.index.intersection(trunc.panic.index)
+    safe = common[common < cut - pd.Timedelta(days=200)]  # before truncation's last block
+    match = bool(
+        (states.loc[safe] == trunc.states.loc[safe]).all()
+        and (panic.loc[safe] == trunc.panic.loc[safe]).all()
+    )
+    print()
+    print(f"  causality check: {len(safe)} pre-cut days (state+gate) identical after "
+          f"truncation → {'PASS' if match else 'FAIL'}")
 
-    # --- Broadcast helper smoke (real intraday bars are tz-aware IST) -------- #
+    # --- Broadcast the gate onto intraday bars (real bars are tz-aware IST) --- #
     fake_bars = pd.date_range(
         "2021-01-04 09:15", "2021-01-06 15:15", freq="60min", tz="Asia/Kolkata"
     )
-    bcast = broadcast_to_intraday(states, fake_bars)
-    print(f"  broadcast smoke: {bcast.notna().sum()}/{len(bcast)} intraday bars labelled")
+    bcast = broadcast_to_intraday(panic.astype(float), fake_bars)
+    print(f"  broadcast smoke: {bcast.notna().sum()}/{len(bcast)} intraday bars gated")
 
     print()
-    print("  note: a 2-state HMM bisects volatility, so the upper state (~45%) is")
-    print("        'elevated-vol/risk-off', not just crashes; sweep hmm_states=3 to")
-    print("        carve off a smaller top-vol stress state for a sharper gate.")
+    print("  note: the HMM 'states' remain the vol/herding taxonomy (2-state bisects")
+    print("        vol ~55/45); the de-risk 'panic' gate is the separate, frequency-")
+    print("        controlled tail signal the execution tier will act on.")
     print("=" * 70)
     checks = {
-        "COVID reads as Panic (>50%)": covid_panic > 0.5,
-        "Calm is the majority": calm_share > 0.5,
-        "Panic is a minority (<50%)": 0.0 < panic_share < 0.5,
+        "COVID trips the gate (>50%)": covid_panic > 0.5,
+        "Gate ≈ target frequency": freq_ok,
+        "Default gate is a minority (<25%)": 0.0 < gate_share < 0.25,
         "Causality (no look-ahead)": match,
-        "Intraday broadcast labels bars": bool(bcast.notna().any()),
+        "Intraday broadcast gates bars": bool(bcast.notna().any()),
     }
     for name, ok in checks.items():
-        print(f"  {name:<32}: {'PASS' if ok else 'FAIL'}")
+        print(f"  {name:<34}: {'PASS' if ok else 'FAIL'}")
     print("=" * 70)

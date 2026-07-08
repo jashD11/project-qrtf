@@ -115,11 +115,27 @@ Calm is the majority, a truncation test confirms zero look-ahead, fit+decode ~4s
   backward, which would leak future within the block.
 - **[DONE] Standardize features** with **expanding, past-only z-score**
   (`zscore_min_periods=252`) — leak-free and scale-equalizing.
-- **[DONE] States:** default **2** (Calm/Panic), `hmm_states` sweepable to **3**
-  (detector is n-state-generic; variance-ordered remap each refit). NOTE: a 2-state
-  HMM bisects vol (~45% "Panic"); 3 states carve off a smaller top-vol stress state.
-  The *sandbox* Tier 3 still hard-codes a binary gate — the (deferred) *production*
-  execution tier must map states→exposure generically.
+- **[DONE] States:** default **2**, `hmm_states` sweepable to **3** (n-state-generic;
+  variance-ordered remap each refit).
+- **[DIAGNOSED] Why the raw HMM state is ~45% "Panic" — and the fix.** The states
+  are *correct* (they split on vol+herding, not noise; ~1.8σ apart; COVID 100%
+  inside), but 2 states can only **bisect** the vol continuum, so the upper state
+  ≈ the above-median-vol half (~45%). And posteriors **saturate** — self-transition
+  ≈ 0.98 because vol is genuinely persistent, so the filter is >90% confident on
+  ~92% of days — which means a *probability cutoff can never be a frequency dial*
+  (no mass in the middle to move). Top-state fraction only falls with more states
+  (2→45%, 3→27%, 4→12%). **Resolution: two separate outputs.**
+  - *HMM regime* (`states`/`probs`): the vol/herding taxonomy + posteriors (for the
+    feature-injection path). Not a crisis flag.
+  - *De-risk gate* (`panic`/`stress`): a **causal severity-percentile** on a
+    continuous stress score (mean of z-vol & z-herding). `panic_threshold` (default
+    0.85) marks the top ~15% most-stressed days vs their own trailing history —
+    leak-free, monotone frequency control (realized ~21% here; drifts above target
+    in rising-vol eras because the trailing quantile lags — expected/desirable).
+    `transmat_stickiness` is a persistence/turnover knob only, **not** a frequency
+    control (it slightly *raises* the high-vol share here).
+  The *sandbox* Tier 3 hard-codes a binary gate — the (deferred) *production*
+  execution tier consumes `panic` (and/or `probs`/`stress`) generically.
 - **[DECIDED] Integration = gate-first, feature-ready.** Regime will size the tree
   book (calm → lever longs, panic → neutral/cash) — mirrors `dynamic_tilt`. Built
   causally and emits per-state **posteriors** (`RegimeResult.probs`) so option (b),

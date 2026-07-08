@@ -98,6 +98,17 @@ class _RegimeConfig:
     refit_every: int = 63                      # refit cadence / decode block (trading days)
     n_iter: int = 200                          # HMM EM iterations
     random_state: int = 42                     # reproducible fits
+    # Calibration knobs (see docs/phase2_design_decisions.md §3):
+    transmat_stickiness: float = 10.0          # diagonal pseudo-counts on the HMM
+                                               # transition prior → more persistent
+                                               # regime spells (a turnover knob; it
+                                               # does NOT set the de-risk frequency).
+    panic_threshold: float = 0.85              # de-risk GATE quantile. HMM posteriors
+                                               # saturate (persistent vol), so the gate
+                                               # is a causal trailing percentile on a
+                                               # continuous stress score: Panic = the
+                                               # top (1 - panic_threshold) most-stressed
+                                               # days. 0.85 → ~15% Panic. → 1.0 = rarer.
 
 
 @dataclass
