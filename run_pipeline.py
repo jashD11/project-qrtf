@@ -1,17 +1,17 @@
 import pandas as pd
 
 from config import StrategyConfig
-from src.utils_simulation import (
+from src.sandbox_run.utils_simulation import (
     generate_synthetic_daily_data,
     save_mock_data,
     get_output_path,
     COUPLED_PARAMS,
 )
-from src.ingestion import ingest_poc_data
-from src.tier1_gkx import calculate_momentum_alpha
-from src.tier2_regime import detect_vol_regime
-from src.tier3_execution import execute_poc_strategy
-from src.tier4_dsr import log_to_dsr_ledger
+from src.sandbox_run.ingestion import ingest_poc_data
+from src.sandbox_run.tier1_gkx import calculate_momentum_alpha
+from src.sandbox_run.tier2_regime import detect_vol_regime
+from src.sandbox_run.tier3_execution import execute_poc_strategy
+from src.sandbox_run.tier4_dsr import log_to_dsr_ledger
 
 DIVIDER: str = "=" * 70
 
@@ -142,7 +142,7 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # Final ledger summary                                               #
     # ------------------------------------------------------------------ #
-    from src.tier4_dsr import LEDGER_PATH
+    from src.sandbox_run.tier4_dsr import LEDGER_PATH
     ledger: pd.DataFrame = pd.read_parquet(LEDGER_PATH)
 
     print(f"\n{DIVIDER}")
