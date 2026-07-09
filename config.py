@@ -112,14 +112,93 @@ class _RegimeConfig:
 
 
 @dataclass
+class _ExecutionConfig:
+    """
+    Tier 3 (PRODUCTION_ML) capital-allocation constants. See
+    src/production_ml/tier3_execution.py and docs/phase3_design_requirements.md.
+
+    The 130/30 leverage split is a [FIXED] prior, NOT a sweep axis: it is a
+    smooth/monotone exposure dial (in a bull sample 140/40 always "wins", in a
+    bear 120/20 "wins"), so optimizing it just fits the sample's directional
+    drift — textbook overfitting. It is chosen from the net/gross exposure budget
+    and frozen here. Only ``dynamic_tilt`` reads these; long_only/long_short gate
+    to cash on Panic instead.
+    """
+    calm_long_lev: float = 1.30    # [FIXED] Calm 130/30: 1.3x long leg
+    calm_short_lev: float = 0.30   # [FIXED] Calm 130/30: 0.3x protective short
+    panic_long_lev: float = 1.00   # Panic dollar-neutral: 1.0x long
+    panic_short_lev: float = 1.00  # Panic dollar-neutral: 1.0x short (leg activates)
+
+
+@dataclass
+class _CostConfig:
+    """
+    Tier 3 transaction-cost model (PRODUCTION_ML). See
+    src/production_ml/tier3_execution.py.
+
+    OFF by default: current runs are gross (zero cost) so the raw edge is visible
+    first; flip ``apply_costs`` on once the cost assumptions below are settled.
+    Costs are turnover-based — ``oneway_bps`` is charged on notional traded
+    (turnover = Sum|dw|), so a full round-trip pays it twice (once in, once out).
+    """
+    apply_costs: bool = False          # master switch — gross returns while False
+    oneway_bps: float = 10.0           # commission + slippage + half-spread, one
+                                       # way, per unit notional traded (placeholder)
+    short_borrow_bps_annual: float = 50.0  # annual borrow on the short leg's gross
+
+
+@dataclass
+class _DSRConfig:
+    """
+    Tier 4 Deflated-Sharpe credibility gate. See
+    src/production_ml/tier4_dsr_gate.py and docs/phase3_design_requirements.md §0.
+    """
+    benchmark_sharpe: float = 0.0      # SR* floor for the plain PSR (per-period)
+    dsr_threshold: float = 0.95        # DSR pass line (P(true SR > deflated SR*))
+    common_frequency: str = "daily"    # all columns resampled here before scoring
+    trials_override: int | None = None  # N for the multiple-testing deflation;
+                                        # None => ledger column count. Set to the
+                                        # true number of cells searched (e.g. 12).
+
+
+@dataclass
 class _MLConfig:
     lgbm: _LGBMConfig = field(default_factory=_LGBMConfig)
     xgb: _XGBConfig = field(default_factory=_XGBConfig)
     rf: _RFConfig = field(default_factory=_RFConfig)
     regime: _RegimeConfig = field(default_factory=_RegimeConfig)
+    execution: _ExecutionConfig = field(default_factory=_ExecutionConfig)
+    cost: _CostConfig = field(default_factory=_CostConfig)
+    dsr: _DSRConfig = field(default_factory=_DSRConfig)
 
 
 ML_CONFIG: _MLConfig = _MLConfig()
+
+
+# --------------------------------------------------------------------------- #
+# PRODUCTION_ML strategy sweep — the committed grid & sensitivity bands.
+# Source of truth for run_pipeline_ml.py (phase3 R1: the grid is an explicit
+# Cartesian product enumerated here, not an implicit accident of config).
+# See docs/phase3_design_requirements.md.
+# --------------------------------------------------------------------------- #
+# [SWEEP] structural forks the orchestrator iterates.
+SWEEP_FREQUENCIES: list[str] = ["15min", "30min", "60min", "daily"]
+SWEEP_EXECUTION_STYLES: list[str] = ["long_only", "long_short", "dynamic_tilt"]
+
+# hmm_states is deliberately NOT a sweep axis (yet): today the execution tier
+# gates only on the continuous, n_states-independent ``panic`` score, so a
+# 2-state vs 3-state HMM produces return-identical cells. Frozen at 2 until
+# state-conditional execution exists — see docs/phase3_deferred_hmm.md.
+HEADLINE_HMM_STATES: int = 2
+
+# [SENSITIVITY] opt-in robustness scans — a SEPARATE entrypoint, never folded
+# into the headline grid (phase3 R3). Report the whole band, never the peak.
+# lookback_period is intentionally absent: it is a Phase-1 GKX knob with no
+# analog in the full-panel tree pipeline (see docs/phase3_deferred_hmm.md).
+SENSITIVITY_BANDS: dict[str, list] = {
+    "panic_threshold": [0.80, 0.85, 0.90, 0.95],
+    "decile_pct": [0.05, 0.10, 0.15, 0.20],
+}
 
 
 @dataclass
@@ -132,6 +211,9 @@ class StrategyConfig:
     top_n: int = 3          # number of stocks in the long leg
     bottom_n: int = 3       # number of stocks in the short leg (long_short / dynamic_tilt)
     frequency: str = "daily"
+    decile_pct: float = 0.10  # PRODUCTION_ML only — book concentration as a
+                              # fraction of the daily cross-section (SANDBOX uses
+                              # top_n/bottom_n instead). Matches tier1_trees.DECILE_PCT.
 
     @property
     def strategy_id(self) -> str:
@@ -148,7 +230,7 @@ class StrategyConfig:
         param_string: str = (
             f"{self.is_simulation}_{self.market_type}_{self.lookback_period}"
             f"_{self.hmm_states}_{self.execution_style}"
-            f"_{self.top_n}_{self.bottom_n}_{self.frequency}"
+            f"_{self.top_n}_{self.bottom_n}_{self.frequency}_{self.decile_pct}"
         )
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 
