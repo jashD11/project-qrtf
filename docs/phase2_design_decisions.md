@@ -145,15 +145,29 @@ Calm is the majority, a truncation test confirms zero look-ahead, fit+decode ~4s
 
 ---
 
-## 4. Orchestration (not yet built)
+## 4. Orchestration (built)
 
-- **[OPEN] No `PRODUCTION_ML` orchestrator exists.** `run_pipeline.py` is still 100%
-  SANDBOX. Need a mode-branched path (or `run_pipeline_ml.py`) chaining:
-  `load bars(freq) → augment(delivery) → create_features(freq) → TreeAlphaEngine →
-  regime → execution → DSR ledger`.
-- **[OPEN] Back half unwired:** `tier1_trees` emits long/short masks, but nothing
-  converts masks → portfolio returns → ledger. Phase 1 `tier3_execution` / `tier4_dsr`
-  expect the old momentum-rank + regime inputs, not the tree masks.
+- **[DONE] `run_pipeline_ml.py` orchestrator exists.** Separate top-level script
+  (not a MODE branch), chaining `load bars(freq) → create_features(freq) →
+  TreeAlphaEngine → regime → execution → production DSR ledger`. Delivery
+  augmentation is skipped for now (create_features falls back to 17 price-only
+  features); wiring live delivery is a follow-up.
+- **[DONE] Back half wired:** `src/production_ml/tier3_execution.py`
+  (`execute_ml_strategy`) converts tree masks + the regime `panic` gate →
+  per-day variable-k weights → portfolio returns; `tier4_dsr.log_to_dsr_ledger`
+  gained an optional `ledger_path` so PRODUCTION_ML writes a dedicated
+  `production_dsr_matrix.parquet` (sensitivity runs a second file).
+- **[DECIDED] Sweep scope.** Committed **[SWEEP]** axes are `frequency` ×
+  `execution_style` = **12 cells**. `hmm_states` was **dropped from the grid**:
+  the execution tier gates only on the n_states-independent `panic` score, so a
+  2- vs 3-state HMM is return-identical today — sweeping it would inflate the
+  multiple-testing count for no impact. It is frozen at
+  `config.HEADLINE_HMM_STATES = 2`; making it matter (state-conditional sizing /
+  regime-as-tree-feature) is captured in **`docs/phase3_deferred_hmm.md`**.
+  `panic_threshold` / `decile_pct` are **[SENSITIVITY]** (opt-in, separate
+  entrypoint + separate ledger); `lookback_period` has no tree analog and is
+  parked. Leverage split (130/30 → `_ExecutionConfig`), tree hyperparameters,
+  and regime plumbing are **[FIXED]** priors. Orchestrator honors R1–R5.
 
 ---
 
@@ -166,7 +180,23 @@ Calm is the majority, a truncation test confirms zero look-ahead, fit+decode ~4s
 ✅ full dataset        68 stocks consolidated + resampled to 4 aligned parquets
 ✅ FREQ_REGISTRY + frequency-aware loader / feature_creator / tier1_trees
 ✅ Tier 2 HMM redesign — causal market-aware regime detector (tier2_regime.py)
-⬜ PRODUCTION_ML execution/gate tier (masks + regime → weights → returns)
+✅ Sweep-scope design — docs/phase3_design_requirements.md (which axes to sweep)
+✅ Sweep priors in code — config.py (_ExecutionConfig, decile_pct, SWEEP_*/SENSITIVITY_BANDS)
+✅ PRODUCTION_ML execution/gate tier — tier3_execution.py (masks + panic → weights → returns)
+✅ PRODUCTION_ML orchestrator — run_pipeline_ml.py (12-cell grid + sensitivity mode, R1–R5)
 ⬜ Regime-as-tree-feature injection (the "feature" half; posteriors already emitted)
-⬜ PRODUCTION_ML orchestrator + mask→returns→ledger
+⬜ hmm_states given real teeth — state-conditional sizing (docs/phase3_deferred_hmm.md)
+⬜ Live delivery augmentation in the orchestrator (currently 17 price-only features)
+⬜ Full 24→12-cell sweep at all frequencies incl. 15-min (verified on the daily slice)
 ```
+
+## What's left (next-session pickup)
+
+1. **Run the full grid at all frequencies.** Verified end-to-end on the `daily`
+   slice (3 cells, Sharpe ~1.6–1.8); run `python run_pipeline_ml.py` for the full
+   12 cells (15/30/60min are the slow tree fits — see phase3 §2 compute ceiling).
+2. **Wire live delivery augmentation** into the orchestrator loader so the full
+   19-feature schema is used (currently price-only 17; create_features already
+   falls back gracefully).
+3. **Regime-as-tree-feature injection** and **state-conditional sizing** — the two
+   deferred paths that give `hmm_states` real impact; see `docs/phase3_deferred_hmm.md`.
