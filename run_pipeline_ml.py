@@ -54,6 +54,7 @@ from src.sandbox_run.tier4_dsr import log_to_dsr_ledger
 DIVIDER: Final[str] = "=" * 72
 PRODUCTION_LEDGER: Final[str] = "data/trial_database/production_dsr_matrix.parquet"
 SENSITIVITY_LEDGER: Final[str] = "data/trial_database/production_sensitivity_dsr_matrix.parquet"
+DIAGNOSTICS_PATH_TMPL: Final[str] = "data/trial_database/tree_fit_diagnostics_{frequency}.csv"
 
 # Frozen defaults for every sandbox-only StrategyConfig field (meaningless in
 # PRODUCTION_ML, but the shared dataclass requires them / hashes them into the id).
@@ -113,6 +114,25 @@ def compute_regime(hmm_states: int) -> RegimeResult:
     return RegimeDetector(n_states=hmm_states).fit_predict(build_regime_features())
 
 
+def _persist_ic(wf: WalkForwardResult, frequency: str) -> None:
+    """
+    Write the read-only Tier-1 rank-IC fit diagnostic for one frequency.
+
+    The IC is a predictive-skill readout only; a header comment warns against
+    misusing it to select cells or tune hyperparameters on OOS data (that is the
+    selection-on-test-statistic bias the DSR gate corrects).
+    """
+    if wf.ic_diagnostics is None:
+        return
+    path = DIAGNOSTICS_PATH_TMPL.format(frequency=frequency)
+    with open(path, "w") as fh:
+        fh.write("# READ-ONLY fit diagnostic (cross-sectional rank IC). Do NOT use to\n")
+        fh.write("# select cells or tune hyperparameters on OOS data — that is the\n")
+        fh.write("# selection-on-test-statistic bias the DSR gate exists to correct.\n")
+        wf.ic_diagnostics.to_csv(fh)
+    print(f"[Tier 1] fit diagnostic written -> {path}")
+
+
 # --------------------------------------------------------------------------- #
 # Headline grid (phase3 R1)
 # --------------------------------------------------------------------------- #
@@ -145,6 +165,7 @@ def run_headline_grid(frequencies: list[str], styles: list[str]) -> None:
         print(f"\n{DIVIDER}\n  FREQUENCY: {frequency}\n{DIVIDER}")
         print(f"[Tier 1] Tree walk-forward (decile_pct={DECILE_PCT}) — once for {frequency}")
         wf, price_wide = compute_signals(frequency, DECILE_PCT)
+        _persist_ic(wf, frequency)
 
         for style in styles:
             cfg = make_ml_config(frequency, style)

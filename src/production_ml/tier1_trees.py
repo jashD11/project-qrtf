@@ -80,6 +80,9 @@ DECILE_PCT: Final[float] = 0.10  # top / bottom 10% of the universe
 # --- Shared RNG seed so every run is reproducible -------------------------- #
 _SEED: Final[int] = 42
 
+# --- Fit diagnostic: min cross-section for a day's IC to be well-defined ---- #
+_IC_MIN_NAMES: Final[int] = 5
+
 
 @dataclass
 class WalkForwardResult:
@@ -87,6 +90,84 @@ class WalkForwardResult:
     alpha_scores: pd.DataFrame  # (date x ticker) ensemble Alpha Score
     long_mask: pd.DataFrame     # (date x ticker) 1 = long, 0 = flat
     short_mask: pd.DataFrame    # (date x ticker) -1 = short, 0 = flat
+    ic_diagnostics: pd.DataFrame | None = None  # per-model rank-IC fit report
+                                                # (read-only; see _compute_ic_diagnostics)
+
+
+# --------------------------------------------------------------------------- #
+# Fit diagnostic — cross-sectional rank IC (READ-ONLY)
+# --------------------------------------------------------------------------- #
+# IMPORTANT: the IC below is computed AFTER the out-of-sample predictions are
+# made, purely as a readout of predictive skill. It never feeds back into signal
+# construction, decile allocation, weights, or config/hyperparameter selection —
+# so it introduces zero look-ahead. It must NOT be used to cherry-pick cells or
+# tune hyperparameters on OOS data: that is the selection-on-test-statistic bias
+# the DSR gate exists to correct. Legitimate hyperparameter tuning belongs on an
+# INNER-validation slice of the training window, not on this OOS IC.
+def _compute_ic_diagnostics(
+    pred_panel: pd.DataFrame, realized: pd.Series
+) -> pd.DataFrame:
+    """
+    Per-model cross-sectional rank Information Coefficient over the OOS panel.
+
+    Args:
+        pred_panel: (date, ticker) predictions, one column per learner plus an
+                    ``ensemble`` column.
+        realized:   (date, ticker) realized forward-return label for the same rows.
+
+    For each model column, the daily IC is the Spearman rank correlation between
+    that day's predictions and realized returns across the cross-section (days
+    with fewer than ``_IC_MIN_NAMES`` valid pairs are skipped). Returns a frame
+    indexed by model name (``ensemble`` last) with columns
+    [mean_IC, IC_IR, IC_t, hit_rate, n_days].
+    """
+    model_cols: list[str] = list(pred_panel.columns)
+    joined: pd.DataFrame = pred_panel.join(realized.rename("_realized"), how="inner")
+    joined = joined.dropna(subset=["_realized"])
+
+    def _day_ic(group: pd.DataFrame) -> pd.Series:
+        y: pd.Series = group["_realized"]
+        out: dict[str, float] = {}
+        for m in model_cols:
+            pair: pd.DataFrame = pd.concat([group[m], y], axis=1).dropna()
+            out[m] = (
+                pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman")
+                if len(pair) >= _IC_MIN_NAMES
+                else np.nan
+            )
+        return pd.Series(out)
+
+    daily_ic: pd.DataFrame = joined.groupby(level=DATE_LEVEL).apply(_day_ic)
+
+    rows: list[dict] = []
+    for m in model_cols:
+        ic: pd.Series = daily_ic[m].dropna()
+        n_days: int = int(ic.shape[0])
+        mean_ic: float = float(ic.mean()) if n_days else float("nan")
+        ic_std: float = float(ic.std(ddof=1)) if n_days > 1 else float("nan")
+        ic_ir: float = (
+            mean_ic / ic_std if np.isfinite(ic_std) and ic_std > 0 else float("nan")
+        )
+        ic_t: float = ic_ir * np.sqrt(n_days) if np.isfinite(ic_ir) else float("nan")
+        hit: float = float((ic > 0).mean()) if n_days else float("nan")
+        rows.append(
+            dict(model=m, mean_IC=mean_ic, IC_IR=ic_ir, IC_t=ic_t,
+                 hit_rate=hit, n_days=n_days)
+        )
+
+    out: pd.DataFrame = pd.DataFrame(rows).set_index("model")
+    order: list[str] = [c for c in ("lgbm", "xgb", "rf", "ensemble") if c in out.index]
+    return out.reindex(order)
+
+
+def _print_ic_panel(ic: pd.DataFrame) -> None:
+    """Pretty-print the per-model rank-IC fit diagnostic."""
+    print("[tier1_trees] fit diagnostic — cross-sectional rank IC (pred vs realized fwd ret)")
+    print(f"    {'model':<10}{'meanIC':>9}{'IC_IR':>8}{'IC_t':>8}{'hit%':>7}{'n_days':>8}")
+    for m, row in ic.iterrows():
+        hit_pct: float = row["hit_rate"] * 100.0
+        print(f"    {m:<10}{row['mean_IC']:>9.4f}{row['IC_IR']:>8.3f}"
+              f"{row['IC_t']:>8.2f}{hit_pct:>6.1f}%{int(row['n_days']):>8}")
 
 
 class TreeAlphaEngine:
@@ -213,15 +294,18 @@ class TreeAlphaEngine:
         self,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
-    ) -> pd.Series:
+    ) -> tuple[pd.Series, pd.DataFrame]:
         """
         Fit every active model on the training block and return the ensemble
-        Alpha Score for the out-of-sample test block.
+        Alpha Score plus each learner's raw predictions for the OOS test block.
 
-        Returns a Series indexed by the test block's ('date', 'ticker') rows.
-        Rows whose chosen target is NaN (trailing / cross-session labels kept by
-        the feature factory) are dropped from training only — every test row is
-        still scored, since prediction needs features, not a label.
+        Returns ``(ensemble, per_model)`` where ``ensemble`` is a Series indexed
+        by the test block's ('date', 'ticker') rows (the driving Alpha Score) and
+        ``per_model`` is a DataFrame of the same index with one column per active
+        learner plus an ``ensemble`` column — consumed only by the read-only IC
+        diagnostic. Rows whose chosen target is NaN (trailing / cross-session
+        labels kept by the feature factory) are dropped from training only —
+        every test row is still scored, since prediction needs features, not a label.
         """
         train_ok: pd.Series = train_df[self.target_col].notna()
         x_train: pd.DataFrame = train_df.loc[train_ok, self.feature_cols]
@@ -229,14 +313,24 @@ class TreeAlphaEngine:
         x_test: pd.DataFrame = test_df[self.feature_cols]
 
         models = self._build_models()
+        model_names: list[str] = list(models.keys())
         preds: list[np.ndarray] = []
         for model in models.values():
             model.fit(x_train.values, y_train.values)
             preds.append(model.predict(x_test.values))
 
         # Multi-model voting: average the raw return predictions per asset.
-        ensemble: np.ndarray = np.mean(np.column_stack(preds), axis=1)
-        return pd.Series(ensemble, index=test_df.index, name="alpha_score")
+        pred_stack: np.ndarray = np.column_stack(preds)
+        ensemble: np.ndarray = pred_stack.mean(axis=1)
+
+        ensemble_series: pd.Series = pd.Series(
+            ensemble, index=test_df.index, name="alpha_score"
+        )
+        per_model: pd.DataFrame = pd.DataFrame(
+            pred_stack, index=test_df.index, columns=model_names
+        )
+        per_model["ensemble"] = ensemble
+        return ensemble_series, per_model
 
     # ---------------------------------------------------------------------- #
     # Walk-forward orchestration
@@ -285,6 +379,8 @@ class TreeAlphaEngine:
             return df.iloc[lo:hi]
 
         oos_scores: list[pd.Series] = []
+        oos_per_model: list[pd.DataFrame] = []   # for the read-only IC diagnostic
+        oos_realized: list[pd.Series] = []       # realized labels aligned to preds
         n_folds: int = 0
 
         # Start scoring the first day for which a full training window exists.
@@ -299,7 +395,10 @@ class TreeAlphaEngine:
 
             has_train_labels: bool = bool(train_block[self.target_col].notna().any())
             if not test_block.empty and has_train_labels:
-                oos_scores.append(self._fit_predict_block(train_block, test_block))
+                ensemble, per_model = self._fit_predict_block(train_block, test_block)
+                oos_scores.append(ensemble)
+                oos_per_model.append(per_model)
+                oos_realized.append(test_block[self.target_col])
                 n_folds += 1
 
             start += self.predict_window
@@ -312,15 +411,22 @@ class TreeAlphaEngine:
 
         long_mask, short_mask = self._allocate_deciles(alpha_scores)
 
+        # Read-only fit diagnostic — does NOT touch the alpha/decile path above.
+        pred_panel: pd.DataFrame = pd.concat(oos_per_model).sort_index()
+        realized: pd.Series = pd.concat(oos_realized).sort_index()
+        ic_diagnostics: pd.DataFrame = _compute_ic_diagnostics(pred_panel, realized)
+
         print(
             f"[tier1_trees] Walk-forward done | model={self.model_choice} | "
             f"target={self.target_col} | folds={n_folds} | "
             f"OOS days={alpha_scores.shape[0]} | universe={alpha_scores.shape[1]}"
         )
+        _print_ic_panel(ic_diagnostics)
         return WalkForwardResult(
             alpha_scores=alpha_scores,
             long_mask=long_mask,
             short_mask=short_mask,
+            ic_diagnostics=ic_diagnostics,
         )
 
     # ---------------------------------------------------------------------- #
@@ -484,3 +590,27 @@ if __name__ == "__main__":
     print(f"  short side == {expected_k} every day : {'PASS' if short_ok else 'FAIL'}")
     print(f"  no long/short overlap        : {'PASS' if no_overlap else f'FAIL ({overlap})'}")
     print("=" * 70)
+
+    # --- Tree-fit IC diagnostic -------------------------------------------- #
+    # _make_dummy_features injects a faint feature->target signal, so a correctly
+    # wired IC must be positive (the trees recover it).
+    print()
+    print("=" * 70)
+    print("Tree-fit IC diagnostic")
+    print("=" * 70)
+    ic = result.ic_diagnostics
+    _print_ic_panel(ic)
+
+    ic_checks: dict[str, bool] = {
+        "IC panel has all learners + ensemble":
+            set(ic.index) == {"lgbm", "xgb", "rf", "ensemble"},
+        "ensemble mean IC > 0 on synthetic signal":
+            float(ic.loc["ensemble", "mean_IC"]) > 0,
+        "ensemble IC_t is finite":
+            bool(np.isfinite(ic.loc["ensemble", "IC_t"])),
+    }
+    print()
+    for name, ok in ic_checks.items():
+        print(f"  {name:<44}: {'PASS' if ok else 'FAIL'}")
+    print("=" * 70)
+    assert all(ic_checks.values()), "tier1_trees IC diagnostic FAILED"
