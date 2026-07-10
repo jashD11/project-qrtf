@@ -80,6 +80,11 @@ class _RFConfig:
     n_estimators: int = 100
     max_depth: int = 15
     min_samples_split: int = 5
+    # Parallel workers for RF. 15-min peaked at ~3.5 GB of 16 with n_jobs=4, so
+    # cores (not RAM) are the constraint — pushed to 6 (of 8) for speed while
+    # leaving headroom for the OS + OMP-pinned LGBM/XGB. n_jobs does NOT change a
+    # RandomForest's output (per-tree seeds are deterministic), only speed/RAM.
+    n_jobs: int = 6
 
 
 @dataclass
@@ -131,20 +136,51 @@ class _ExecutionConfig:
 
 
 @dataclass
-class _CostConfig:
+class _NSECostConfig:
     """
-    Tier 3 transaction-cost model (PRODUCTION_ML). See
-    src/production_ml/tier3_execution.py.
+    Tier 3 transaction-cost model (PRODUCTION_ML), grounded in NSE cash-equity
+    DELIVERY charges — the strategy carries net positions overnight, so delivery
+    rates apply, not intraday square-off. See src/production_ml/tier3_execution.py
+    and docs/phase3_design_requirements.md.
 
-    OFF by default: current runs are gross (zero cost) so the raw edge is visible
-    first; flip ``apply_costs`` on once the cost assumptions below are settled.
-    Costs are turnover-based — ``oneway_bps`` is charged on notional traded
-    (turnover = Sum|dw|), so a full round-trip pays it twice (once in, once out).
+    Each component is an itemized, citable line item in basis points of the
+    notional traded on ONE side. ``compose_oneway_bps`` blends the asymmetric
+    buy/sell legs (STT both sides, stamp buy-only, GST on the broker/exchange/SEBI
+    base) into one symmetric one-way rate, since turnover (= Sum|dw|) is
+    side-agnostic. Costs are charged on turnover, so a round-trip pays twice.
     """
-    apply_costs: bool = False          # master switch — gross returns while False
-    oneway_bps: float = 10.0           # commission + slippage + half-spread, one
-                                       # way, per unit notional traded (placeholder)
+    apply_costs: bool = True            # master switch — NET returns by default
+                                        # (set False to recover gross reference)
+    # --- itemized NSE delivery components (bps per side of traded notional) --- #
+    brokerage_bps: float = 3.0          # institutional / discount, per side
+    stt_delivery_bps: float = 10.0      # STT 0.10%, charged on BOTH buy and sell
+    exchange_txn_bps: float = 0.30      # NSE cash txn charge (~0.00297%)
+    sebi_bps: float = 0.01              # SEBI turnover fee (0.0001%)
+    stamp_duty_bps_buy: float = 1.5     # stamp duty 0.015%, BUY side only (delivery)
+    gst_pct: float = 18.0               # GST on (brokerage + exchange + SEBI)
+    slippage_bps: float = 0.0           # market-impact / half-spread — DEFERRED
+                                        # (see design doc); 0 for now
     short_borrow_bps_annual: float = 50.0  # annual borrow on the short leg's gross
+
+    def compose_oneway_bps(self) -> float:
+        """
+        Effective symmetric one-way cost (bps) charged on turnover.
+
+            buy  = brokerage + STT + exchange + SEBI + stamp_buy + GST(base) + slip
+            sell = brokerage + STT + exchange + SEBI +           + GST(base) + slip
+            oneway = (buy + sell) / 2   (a rebalance is ~half buy / half sell)
+
+        At defaults this composes to ~14.7 bps (vs the old flat 10 placeholder).
+        """
+        gst_base: float = self.brokerage_bps + self.exchange_txn_bps + self.sebi_bps
+        gst: float = gst_base * (self.gst_pct / 100.0)
+        common: float = (
+            self.brokerage_bps + self.stt_delivery_bps + self.exchange_txn_bps
+            + self.sebi_bps + gst + self.slippage_bps
+        )
+        buy: float = common + self.stamp_duty_bps_buy
+        sell: float = common
+        return 0.5 * (buy + sell)
 
 
 @dataclass
@@ -168,7 +204,7 @@ class _MLConfig:
     rf: _RFConfig = field(default_factory=_RFConfig)
     regime: _RegimeConfig = field(default_factory=_RegimeConfig)
     execution: _ExecutionConfig = field(default_factory=_ExecutionConfig)
-    cost: _CostConfig = field(default_factory=_CostConfig)
+    cost: _NSECostConfig = field(default_factory=_NSECostConfig)
     dsr: _DSRConfig = field(default_factory=_DSRConfig)
 
 
@@ -198,6 +234,7 @@ HEADLINE_HMM_STATES: int = 2
 SENSITIVITY_BANDS: dict[str, list] = {
     "panic_threshold": [0.80, 0.85, 0.90, 0.95],
     "decile_pct": [0.05, 0.10, 0.15, 0.20],
+    "rebalance_buffer_mult": [1.5, 2.0, 2.5, 3.0],
 }
 
 
@@ -214,6 +251,11 @@ class StrategyConfig:
     decile_pct: float = 0.10  # PRODUCTION_ML only — book concentration as a
                               # fraction of the daily cross-section (SANDBOX uses
                               # top_n/bottom_n instead). Matches tier1_trees.DECILE_PCT.
+    rebalance_buffer_mult: float = 2.0  # PRODUCTION_ML no-trade hysteresis: a name
+                                        # enters a leg at decile_pct but is only
+                                        # evicted once it drifts past
+                                        # decile_pct*mult. >=1.0; 1.0 disables the
+                                        # buffer (enter==exit). Turnover control.
 
     @property
     def strategy_id(self) -> str:
@@ -231,6 +273,7 @@ class StrategyConfig:
             f"{self.is_simulation}_{self.market_type}_{self.lookback_period}"
             f"_{self.hmm_states}_{self.execution_style}"
             f"_{self.top_n}_{self.bottom_n}_{self.frequency}_{self.decile_pct}"
+            f"_{self.rebalance_buffer_mult}"
         )
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 

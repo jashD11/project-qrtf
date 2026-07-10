@@ -28,6 +28,7 @@ other knobs are frozen at SENSITIVITY_BASE before the scan (freeze-before-test).
 """
 
 import argparse
+import gc
 import itertools
 from typing import Final
 
@@ -48,7 +49,7 @@ from src.production_ml.tier2_regime import (
     build_features as build_regime_features,
 )
 from src.production_ml.tier3_execution import execute_ml_strategy
-from src.production_ml.tier4_dsr_gate import run_dsr_gate
+from src.production_ml.tier4_dsr_gate import run_dsr_gate, _to_daily
 from src.sandbox_run.tier4_dsr import log_to_dsr_ledger
 
 DIVIDER: Final[str] = "=" * 72
@@ -63,7 +64,8 @@ _LIVE_LOOKBACK: Final[int] = 0
 
 # The frozen base config for [SENSITIVITY] scans (phase3 R5: freeze before test).
 SENSITIVITY_BASE: Final[dict] = dict(
-    frequency="daily", execution_style="dynamic_tilt", decile_pct=DECILE_PCT
+    frequency="daily", execution_style="dynamic_tilt", decile_pct=DECILE_PCT,
+    rebalance_buffer_mult=2.0,
 )
 
 
@@ -72,6 +74,7 @@ def make_ml_config(
     execution_style: str,
     decile_pct: float = DECILE_PCT,
     hmm_states: int = config.HEADLINE_HMM_STATES,
+    rebalance_buffer_mult: float = 2.0,
 ) -> StrategyConfig:
     """A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels."""
     return StrategyConfig(
@@ -82,6 +85,7 @@ def make_ml_config(
         execution_style=execution_style,
         frequency=frequency,
         decile_pct=decile_pct,
+        rebalance_buffer_mult=rebalance_buffer_mult,
     )
 
 
@@ -103,9 +107,14 @@ def compute_signals(frequency: str, decile_pct: float) -> tuple[WalkForwardResul
     """Tier 1 tree walk-forward for one frequency. Returns (wf_result, price_wide)."""
     bars = load_ohlcv_multiindex(frequency)
     features = create_features(bars, frequency)
+    # Extract the (small) price panel now, then drop the ~4M-row raw OHLCV frame
+    # so it is not resident during the memory-critical walk-forward tree loop.
+    # price_wide does not depend on the walk-forward, so this reorder is safe.
+    price_wide = bars[CLOSE_COL].unstack(level=TICKER_LEVEL)
+    del bars
+    gc.collect()
     engine = TreeAlphaEngine.from_frequency(frequency, decile_pct=decile_pct)
     wf = engine.run_walk_forward(features)
-    price_wide = bars[CLOSE_COL].unstack(level=TICKER_LEVEL)
     return wf, price_wide
 
 
@@ -144,7 +153,9 @@ def build_headline_grid(frequencies: list[str], styles: list[str]) -> list[Strat
     ]
 
 
-def run_headline_grid(frequencies: list[str], styles: list[str]) -> None:
+def run_headline_grid(
+    frequencies: list[str], styles: list[str], skip_dsr: bool = False
+) -> None:
     configs = build_headline_grid(frequencies, styles)
 
     print(DIVIDER)
@@ -171,12 +182,24 @@ def run_headline_grid(frequencies: list[str], styles: list[str]) -> None:
             cfg = make_ml_config(frequency, style)
             print(f"\n[Tier 3] {frequency} | {style}")
             returns = execute_ml_strategy(wf, panic, price_wide, cfg)
-            log_to_dsr_ledger(cfg.strategy_id, returns, ledger_path=PRODUCTION_LEDGER)
+            # Compound intraday bars to daily BEFORE logging so every frequency
+            # shares the ledger's daily index. Without this, intraday bar
+            # timestamps miss the daily index labels and the column lands all-NaN
+            # (T=0). Idempotent for already-daily series (one bar/day passes
+            # through); the DSR gate re-applies _to_daily harmlessly on read.
+            daily_returns = _to_daily(returns)
+            log_to_dsr_ledger(cfg.strategy_id, daily_returns, ledger_path=PRODUCTION_LEDGER)
 
     _summarize(configs, PRODUCTION_LEDGER, frequencies, styles)
 
     # Tier 4 — the credibility gate: deflate each Sharpe for the full grid's
     # multiple-testing count (N = every cell searched, not just what's written).
+    # Skipped for partial (per-frequency) runs, where len(configs) would be the
+    # wrong N; run `--dsr` once at the end for the authoritative N=column-count.
+    if skip_dsr:
+        print("\n[Tier 4] DSR gate skipped (--skip-dsr); run `--dsr` after the "
+              "full grid is banked for the authoritative N-trial verdict.")
+        return
     print()
     run_dsr_gate(PRODUCTION_LEDGER, n_trials=len(configs))
 
@@ -231,7 +254,10 @@ def run_sensitivity(axis: str) -> None:
                 ).fit_predict(regime_feats)
             panic = regime_default.panic
 
-        cfg = make_ml_config(frequency, params["execution_style"], decile_pct=decile_pct)
+        cfg = make_ml_config(
+            frequency, params["execution_style"], decile_pct=decile_pct,
+            rebalance_buffer_mult=params["rebalance_buffer_mult"],
+        )
         sid = f"SENS_{axis.upper()}_{value}_{cfg.strategy_id}"
         print(f"\n[Sensitivity] {axis}={value}")
         returns = execute_ml_strategy(wf, panic, price_wide, cfg)
@@ -321,6 +347,12 @@ def main() -> None:
         help="score the DSR credibility gate on an EXISTING ledger (no recompute); "
              "optionally pass a ledger path (default: the production ledger)",
     )
+    parser.add_argument(
+        "--skip-dsr", action="store_true",
+        help="skip the auto-DSR gate at the end of the grid (for per-frequency "
+             "partial runs, whose len(configs) is the wrong N); run `--dsr` "
+             "separately once the full grid is banked",
+    )
     args = parser.parse_args()
 
     if args.dsr is not None:
@@ -328,7 +360,7 @@ def main() -> None:
     elif args.sensitivity:
         run_sensitivity(args.sensitivity)
     else:
-        run_headline_grid(args.frequencies, args.styles)
+        run_headline_grid(args.frequencies, args.styles, skip_dsr=args.skip_dsr)
 
 
 if __name__ == "__main__":

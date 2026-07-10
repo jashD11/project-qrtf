@@ -25,6 +25,7 @@ The engine emits three aligned wide DataFrames (index = date, columns = ticker):
 ``alpha_scores``, ``long_mask`` (1/0) and ``short_mask`` (-1/0).
 """
 
+import gc
 import os
 import sys
 from dataclasses import dataclass
@@ -283,7 +284,7 @@ class TreeAlphaEngine:
                 max_depth=ml.rf.max_depth,
                 min_samples_split=ml.rf.min_samples_split,
                 random_state=_SEED,
-                n_jobs=-1,
+                n_jobs=ml.rf.n_jobs,   # capped to bound peak RAM; result-invariant
             )
         return models
 
@@ -401,6 +402,9 @@ class TreeAlphaEngine:
                 oos_realized.append(test_block[self.target_col])
                 n_folds += 1
 
+            # Release this fold's fitted forests (largest transient) before the
+            # next fold allocates — bounds peak RAM on the intraday cells.
+            gc.collect()
             start += self.predict_window
 
         if not oos_scores:

@@ -63,6 +63,7 @@ robustness check, not a search. `ensemble` is a fine default.
 | De-risk gate | `panic_threshold` (`ML_CONFIG.regime`) | 0.80 / 0.85 / 0.90 / 0.95 | Policy: "de-risk ~15% of days" → 0.85. Report the frequency/return curve; do **not** pick the peak. See phase2 §3. |
 | Momentum lookback | `lookback_period` | 2–3 points around default | Feature-horizon judgment. |
 | Book concentration | `top_n` / `bottom_n` | 2–3 points | = risk appetite (concentration vs breadth). |
+| No-trade buffer | `rebalance_buffer_mult` (`StrategyConfig`) | 1.5 / 2.0 / 2.5 / 3.0 | Turnover vs signal-freshness trade. Frozen at 2× by convention (standard index-buffering band); scan reports the turnover/net-Sharpe curve. See §4. |
 
 ### [FIXED] — set by prior, never swept (smooth / overfit bait / defensible default)
 
@@ -119,7 +120,61 @@ worse-performing strategy. Spend the budget on the two or three forks where the
 
 ---
 
-## 4. Open items
+## 4. Transaction-cost model & turnover control
+
+Gross returns answer "is there an edge?"; **net** returns answer "does it survive
+being traded?" Two pieces make the net verdict honest: a realistic per-trade cost,
+and a mechanism that stops trading on trivial signal changes.
+
+### 4.1 No-trade hysteresis buffer (`rebalance_buffer_mult`, Tier 3)
+
+The raw decile signal rebalances the whole book every bar off alpha churn — a name
+jittering across the decile edge (rank `k` ↔ `k+1`) forces a round-trip even though
+the alpha barely moved. The buffer is a **two-band hysteresis** on decile
+membership: a name **enters** a leg at the top/bottom `decile_pct` band but is only
+**evicted** once it drifts past the wider `decile_pct × rebalance_buffer_mult` exit
+band. Incumbent-preferring, applied **symmetrically to both legs** (long ranks by
+descending alpha, short by ascending); `long_only` buffers the long leg only. Book
+size stays ~`k_enter`, so 1/k weights and per-leg exposure are unchanged. It is the
+one deliberately **sequential** step in Tier 3 (hysteresis is path-dependent);
+`buffer_mult = 1.0` is an exact no-op (raw deciles). Panic is handled by the gate's
+book-zeroing in `build_weight_matrix` (which charges the liquidation/re-entry
+turnover), so the buffer stays panic-agnostic. Lives in
+`tier3_execution.apply_rebalance_buffer`. **[SENSITIVITY]**, frozen at 2×.
+
+### 4.2 NSE delivery cost stack (`_NSECostConfig`, `config.py`)
+
+The prior flat `oneway_bps=10` placeholder is replaced by an **itemized NSE
+cash-equity DELIVERY stack** — delivery, not intraday square-off, because the
+strategy carries net positions overnight. Each line item is a citable bps-per-side
+figure; `compose_oneway_bps()` blends the asymmetric buy/sell legs into one
+symmetric one-way rate (turnover `Σ|Δw|` is side-agnostic):
+
+| Component | Rate (per side) | Sides |
+|---|---|---|
+| Brokerage | 3.0 bps | both |
+| STT (delivery) | 10.0 bps (0.10%) | **both** buy & sell |
+| Exchange txn (NSE) | 0.30 bps (~0.00297%) | both |
+| SEBI turnover fee | 0.01 bps (0.0001%) | both |
+| Stamp duty | 1.5 bps (0.015%) | **buy only** |
+| GST | 18% on (brokerage + exchange + SEBI) | both |
+| **Effective one-way** | **≈ 14.7 bps** | `(buy+sell)/2` |
+
+Charged on turnover, so a round-trip pays it twice. Short-leg **borrow** (50 bps/yr
+on short notional) is charged separately and is negligible next to trade drag.
+
+### 4.3 [DEFERRED] Slippage / market-impact
+
+`slippage_bps = 0.0` for now — it is the one **discretionary, non-mechanical**
+component and doing it right needs a size/liquidity-dependent impact model
+(participation rate, spread, ADV), not a flat constant. It slots into
+`_NSECostConfig.slippage_bps` and flows through `compose_oneway_bps()` unchanged
+when we add it. Until then the net verdict is a **lower bound** on cost (upper bound
+on net Sharpe): a strategy that fails net even at zero slippage fails, full stop; one
+that passes must still clear a slippage haircut before it is real. Revisit once the
+headline net grid identifies which cells are even worth an impact study.
+
+## 5. Open items
 
 - **[OPEN]** Confirm the frozen leverage split (130/30) as the single dynamic_tilt
   default vs. exposing net/gross exposure as the *economic* parameter it derives
