@@ -130,6 +130,98 @@ def build_weight_matrix(
 
 
 # --------------------------------------------------------------------------- #
+# No-trade hysteresis buffer (turnover control) — the one SEQUENTIAL step
+# --------------------------------------------------------------------------- #
+def apply_rebalance_buffer(
+    alpha_scores: pd.DataFrame,
+    cfg: StrategyConfig,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Two-band hysteresis on decile membership to suppress boundary churn.
+
+    A name ENTERS a leg at the top/bottom ``decile_pct`` band but is only EVICTED
+    once it drifts past the wider ``decile_pct * rebalance_buffer_mult`` exit band
+    — so a name jittering across the decile edge (rank k <-> k+1) no longer forces
+    a costly round-trip. Incumbent-preferring per side: retain held names still
+    inside the exit band (best-ranked first), then fill remaining slots up to the
+    enter width ``k_enter`` with the best-ranked names in the enter band. Book size
+    stays ~``k_enter``, so 1/k weights and per-leg gross/net exposure are unchanged
+    vs raw deciles.
+
+    The LONG leg ranks by DESCENDING alpha (best first); the SHORT leg ranks by
+    ASCENDING alpha (worst first) — the identical hysteresis, mirrored. Applied to
+    both legs for ``long_short`` / ``dynamic_tilt``; ``long_only`` computes the long
+    leg only. ``buffer_mult == 1.0`` reproduces the raw per-bar deciles exactly
+    (enter band == exit band), which is why ``execute_ml_strategy`` skips this call
+    entirely in that case.
+
+    Panic is intentionally NOT handled here: the de-risk gate zeroes the book in
+    ``build_weight_matrix``, which already charges the liquidation + re-entry
+    turnover via ``weights.diff()``. Keeping the buffer panic-agnostic makes it a
+    pure function of the alpha ranks (and makes mult==1.0 an exact no-op).
+
+    This is the only deliberately SEQUENTIAL step in Tier 3 (hysteresis is
+    path-dependent and cannot be vectorized over time), but the per-bar work is
+    O(k) set ops on precomputed cross-sectional ranks — trivial vs the tree fits.
+    """
+    decile_pct: float = cfg.decile_pct
+    mult: float = cfg.rebalance_buffer_mult
+    do_short: bool = cfg.execution_style in ("long_short", "dynamic_tilt")
+
+    index: pd.Index = alpha_scores.index
+    columns: pd.Index = alpha_scores.columns
+    n_bars: int = len(index)
+
+    # Cross-sectional ranks computed once, vectorized (NaN where a name is absent
+    # that bar). rank 1 = best-alpha (desc) / worst-alpha (asc).
+    rank_desc: np.ndarray = alpha_scores.rank(axis=1, ascending=False, method="first").to_numpy()
+    rank_asc: np.ndarray = alpha_scores.rank(axis=1, ascending=True, method="first").to_numpy()
+    valid_counts: np.ndarray = alpha_scores.notna().sum(axis=1).to_numpy()
+
+    held_long: np.ndarray = np.zeros((n_bars, len(columns)), dtype=np.int8)
+    held_short: np.ndarray = np.zeros((n_bars, len(columns)), dtype=np.int8)
+
+    def _buffer_leg(rank_row: np.ndarray, prev: list[int], k_enter: int, k_exit: int) -> list[int]:
+        # Retain incumbents still inside the (wider) exit band, best-ranked first.
+        # A NaN rank (name left the universe) fails ``<= k_exit`` and is dropped.
+        retained: list[int] = [c for c in prev if rank_row[c] <= k_exit]
+        retained.sort(key=lambda c: rank_row[c])
+        if len(retained) >= k_enter:
+            return retained[:k_enter]
+        # Fill remaining slots with the best-ranked names in the (tighter) enter band.
+        enter_cols: np.ndarray = np.where(rank_row <= k_enter)[0]
+        enter_cols = enter_cols[np.argsort(rank_row[enter_cols])]
+        keep: set[int] = set(retained)
+        fill: list[int] = [int(c) for c in enter_cols if int(c) not in keep]
+        return retained + fill[: k_enter - len(retained)]
+
+    prev_long: list[int] = []
+    prev_short: list[int] = []
+    for t in range(n_bars):
+        n: int = int(valid_counts[t])
+        if n == 0:
+            prev_long, prev_short = [], []
+            continue
+        k_enter: int = max(1, int(np.floor(n * decile_pct)))
+        # Exit band wider by mult, capped at n//2 so the long and short hold-zones
+        # can never overlap (a name can't be sticky-long and sticky-short at once).
+        k_exit: int = max(k_enter, min(int(np.floor(n * decile_pct * mult)), n // 2))
+
+        new_long: list[int] = _buffer_leg(rank_desc[t], prev_long, k_enter, k_exit)
+        held_long[t, new_long] = 1
+        prev_long = new_long
+
+        if do_short:
+            new_short: list[int] = _buffer_leg(rank_asc[t], prev_short, k_enter, k_exit)
+            held_short[t, new_short] = 1
+            prev_short = new_short
+
+    held_long_mask: pd.DataFrame = pd.DataFrame(held_long, index=index, columns=columns)
+    held_short_mask: pd.DataFrame = pd.DataFrame(-held_short, index=index, columns=columns)  # -1/0
+    return held_long_mask, held_short_mask
+
+
+# --------------------------------------------------------------------------- #
 # Gate alignment (daily gate -> bar frequency)
 # --------------------------------------------------------------------------- #
 def _align_panic(panic: pd.Series, bar_index: pd.Index, frequency: str) -> pd.Series:
@@ -170,8 +262,14 @@ def execute_ml_strategy(
     Returns:
         Net portfolio return per bar, indexed by bar timestamp, NaN-free.
     """
-    long_mask: pd.DataFrame = wf_result.long_mask
-    short_mask: pd.DataFrame = wf_result.short_mask
+    # No-trade hysteresis buffer (turnover control). mult<=1.0 keeps the raw
+    # per-bar deciles (exact no-op); >1.0 makes decile membership sticky so
+    # boundary jitter (rank k <-> k+1) stops forcing round-trips.
+    if cfg.rebalance_buffer_mult > 1.0:
+        long_mask, short_mask = apply_rebalance_buffer(wf_result.alpha_scores, cfg)
+    else:
+        long_mask = wf_result.long_mask
+        short_mask = wf_result.short_mask
 
     panic_bars: pd.Series = _align_panic(panic, long_mask.index, cfg.frequency)
     weights: pd.DataFrame = build_weight_matrix(long_mask, short_mask, panic_bars, cfg)
@@ -203,7 +301,7 @@ def execute_ml_strategy(
     trade_drag = borrow_drag = 0.0
     if cost_cfg.apply_costs:
         ppy: float = config.freq_spec(cfg.frequency).bars_per_day * 252.0
-        trade_cost: pd.Series = turnover * (cost_cfg.oneway_bps / 1e4)
+        trade_cost: pd.Series = turnover * (cost_cfg.compose_oneway_bps() / 1e4)
         short_gross: pd.Series = weights.clip(upper=0.0).abs().sum(axis=1)
         borrow_cost: pd.Series = short_gross * (cost_cfg.short_borrow_bps_annual / 1e4) / ppy
         net = gross - trade_cost - borrow_cost
@@ -239,7 +337,9 @@ def execute_ml_strategy(
 # Dry-run verification — synthetic masks + prices + gate, assert gate semantics
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    from src.production_ml.tier1_trees import TreeAlphaEngine, _make_dummy_features
+    from src.production_ml.tier1_trees import (
+        TreeAlphaEngine, _make_dummy_features, DECILE_PCT,
+    )
 
     print("=" * 70)
     print("tier3_execution dry-run — masks + panic gate -> portfolio returns")
@@ -301,20 +401,66 @@ if __name__ == "__main__":
     cfg = StrategyConfig(
         is_simulation=False, market_type="dryrun", lookback_period=0,
         hmm_states=2, execution_style="dynamic_tilt", frequency="daily",
+        rebalance_buffer_mult=1.0,  # isolate the cost effect from the buffer
     )
-    gross_ret = execute_ml_strategy(wf, panic, price_wide, cfg)  # apply_costs=False default
     try:
+        config.ML_CONFIG.cost.apply_costs = False
+        gross_ret = execute_ml_strategy(wf, panic, price_wide, cfg)
         config.ML_CONFIG.cost.apply_costs = True
-        config.ML_CONFIG.cost.oneway_bps = 10.0
         net_ret = execute_ml_strategy(wf, panic, price_wide, cfg)
     finally:
-        config.ML_CONFIG.cost.apply_costs = False
+        config.ML_CONFIG.cost.apply_costs = True  # restore default (net is the model)
     common = gross_ret.index.intersection(net_ret.index)
     checks["cost ON <= gross every bar"] = bool(
         (net_ret.loc[common] <= gross_ret.loc[common] + 1e-12).all()
     )
     checks["cost ON strictly reduces some bars"] = bool(
         (net_ret.loc[common] < gross_ret.loc[common]).any()
+    )
+    checks["NSE compose_oneway_bps in ~14-15 bps"] = bool(
+        13.0 < config.ML_CONFIG.cost.compose_oneway_bps() < 16.0
+    )
+
+    # --- Rebalance buffer: cuts turnover; both legs sized k_enter; mult=1.0 no-op #
+    cfg_buf = StrategyConfig(
+        is_simulation=False, market_type="dryrun", lookback_period=0,
+        hmm_states=2, execution_style="long_short", frequency="daily",
+        rebalance_buffer_mult=2.0,
+    )
+    cfg_nobuf = StrategyConfig(
+        is_simulation=False, market_type="dryrun", lookback_period=0,
+        hmm_states=2, execution_style="long_short", frequency="daily",
+        rebalance_buffer_mult=1.0,
+    )
+    hl_b, hs_b = apply_rebalance_buffer(wf.alpha_scores, cfg_buf)
+    hl_n, hs_n = apply_rebalance_buffer(wf.alpha_scores, cfg_nobuf)
+
+    def _total_turnover(lm, sm, c):
+        W = build_weight_matrix(lm, sm, panic, c)
+        tv = W.diff().abs().sum(axis=1)
+        if len(W):
+            tv.iloc[0] = W.iloc[0].abs().sum()
+        return float(tv.sum())
+
+    turn_buf = _total_turnover(hl_b, hs_b, cfg_buf)
+    turn_nobuf = _total_turnover(hl_n, hs_n, cfg_nobuf)
+
+    n_valid = wf.alpha_scores.notna().sum(axis=1)
+    k_enter = np.floor(n_valid * DECILE_PCT).clip(lower=1).astype(int)
+    long_ct = (hl_b == 1).sum(axis=1)
+    short_ct = (hs_b == -1).sum(axis=1)
+
+    checks["buffer cuts turnover"] = bool(turn_buf < turn_nobuf)
+    checks["buffer mult=1.0 == raw long deciles"] = bool(
+        (hl_n.to_numpy() == wf.long_mask.to_numpy()).all()
+    )
+    checks["buffer mult=1.0 == raw short deciles"] = bool(
+        (hs_n.to_numpy() == wf.short_mask.to_numpy()).all()
+    )
+    checks["buffered long leg sized k_enter"] = bool((long_ct == k_enter).all())
+    checks["buffered short leg sized k_enter"] = bool((short_ct == k_enter).all())
+    checks["short buffer engages (differs from raw)"] = bool(
+        not (hs_b.to_numpy() == wf.short_mask.to_numpy()).all()
     )
 
     print()
