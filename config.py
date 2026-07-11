@@ -234,7 +234,7 @@ HEADLINE_HMM_STATES: int = 2
 SENSITIVITY_BANDS: dict[str, list] = {
     "panic_threshold": [0.80, 0.85, 0.90, 0.95],
     "decile_pct": [0.05, 0.10, 0.15, 0.20],
-    "rebalance_buffer_mult": [1.5, 2.0, 2.5, 3.0],
+    "rebalance_buffer_mult": [1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
 }
 
 

@@ -151,24 +151,87 @@ reach credibility at SR 0.49).
 
 ---
 
-## Key finding & next step
+## 5. DAILY-ONLY N=3 — 5-day target (`tgt_fwd_logret_5b`, net)
+
+The turnover-reduction experiment: retrain the trees on the **5-day** forward
+log-return instead of 1-day. Everything else identical (daily, buffer 2×, NSE
+delivery costs, DSR N=3). A slower learning target → slower signal → longer holds
+→ lower turnover → less cost erosion. DSR benchmark SR\* = 0.33, cross-trial
+Sharpe std 0.024.
+
+| style | turnover/bar (vs 1-day) | cost drag /yr (vs 1-day) | net CumRet (vs 1-day) | net SR_ann (vs 1-day) | DSR (vs 1-day) | PSR₀ | minTRL |
+|---|---|---|---|---|---|---|---|
+| **long_only** | 0.32 (0.59) | 11.7% (21.9%) | **+123.1%** (+97.4%) | **+0.57** (+0.49) | **0.737** (0.626) | 0.932 | 11,615 |
+| dynamic_tilt | 0.64 (1.23) | 24.0% (45.8%) | +36.1% (+1.4%) | +0.30 (+0.18) | 0.475 (0.312) | 0.786 | n/a |
+| long_short | 0.66 (1.21) | 24.9% (45.2%) | −42.6% (−58.7%) | −0.19 (−0.37) | 0.090 (0.027) | 0.314 | n/a |
+
+**Every cell improved.** The 5-day target ~**halved turnover** (LO 0.59→0.32,
+−46%) and ~halved cost drag on all three styles, lifting net Sharpe across the
+board. Daily long_only: SR +0.49→**+0.57**, DSR 0.626→**0.737**, and minTRL fell
+from ~45,453 to **11,615** days (~180yr → ~46yr to credibility) — a materially
+stronger, more cost-robust edge, though still **short of the 0.95 gate**.
+
+The 5-day **raw IC is marginally lower** (ensemble daily mean_IC 0.019 vs 0.023 at
+1-day; its IC_t is inflated by overlapping 5-day windows) — yet the *tradeable*
+net result is **better**. That is the whole point: the 1-day signal is sharper
+per-name but too expensive to harvest; the 5-day signal gives up a little raw skill
+to trade half as much and nets out ahead. RF now leads the ensemble at daily.
+
+## 6. SENSITIVITY — no-trade buffer width (`rebalance_buffer_mult`, daily long_only, 5-day target)
+
+Robustness scan of the frozen buffer prior, on the headline survivor (daily
+long_only, 5-day target). This is a **[SENSITIVITY]** run on the separate ledger
+(`production_sensitivity_dsr_matrix.parquet`), **not** part of the headline N — we
+report the whole band and never promote the peak (phase3 design §0, §4.1). One
+deterministic tree fit is shared across all six values, so only the Tier-3
+hysteresis varies — a clean isolation of the buffer effect.
+
+| buffer_mult | turnover/bar | cost drag /yr | net CumRet | net SR_ann |
+|---|---|---|---|---|
+| 1.0 (raw deciles) | 0.63 | 23.1% | +36.3% | 0.302 |
+| 1.5 | 0.41 | 15.1% | +78.1% | 0.443 |
+| **2.0 (frozen prior)** | 0.32 | 11.7% | **+123.1%** | **0.569** |
+| 2.5 | 0.27 | 10.0% | +90.1% | 0.485 |
+| 3.0 | 0.24 | 8.7% | +120.3% | 0.567 |
+| 4.0 | 0.20 | 7.3% | +94.0% | 0.501 |
+
+**Read:** turnover and cost drag fall **monotonically** with buffer width
+(0.63→0.20/bar, 23%→7%/yr) — the hysteresis does exactly what it should. But net
+Sharpe is **non-monotonic**: it climbs 1.0→2.0 then **plateaus ~0.50–0.57 across
+2.0–4.0**. Two opposing forces resolve here — a wider band saves cost (good) but
+holds staler signal past its alpha peak (bad), and they roughly balance from 2×
+onward. The frozen prior **2.0 sits in the robust plateau** (0.569, effectively
+tied with 3.0's 0.567), **not** on a fragile spike.
+
+**Methodological conclusion:** this is robustness evidence, not a tuning result.
+The convention pick (2×, standard index-buffering band) was frozen a-priori and
+lands near the top of a flat region — the strategy is *not* balanced on a knife-edge
+buffer value. We therefore keep 2.0 and do **not** promote it or switch to 3.0:
+picking the band's max on the OOS Sharpe is precisely the selection-on-test-statistic
+bias the DSR gate corrects (phase3 §0). Turnover control unambiguously helps — raw
+deciles (mult 1.0, Sharpe 0.302) are the worst cell in the band.
+
+## Key finding
 
 The signal has **real cross-sectional predictive skill** (§1, IC 0.02–0.09) but the
-per-trade edge at a 1-day horizon is too small to survive **realistic NSE delivery
-costs**. Gross→net destroys every intraday cell (−100%) and takes daily long_only
-from SR 1.62 → 0.49. **Cost is essentially the entire gap** — the lever is turnover
-reduction.
-
-Highest-leverage next experiment: **switch the tree target `tgt_fwd_logret_1b` →
-`tgt_fwd_logret_5b`** (5-day horizon → slower signal → lower turnover → less cost
-drag). Note: costs here are a **lower bound** (slippage still deferred, design doc
-§4.3), so net results can only worsen.
+per-trade edge is too small to fully clear **realistic NSE delivery costs**.
+Gross→net destroys every intraday cell (−100%); the surviving edge is **daily
+long_only**, and the lever is **turnover reduction**. Slowing the learning target
+to 5 days (§5) halves turnover and lifts daily long_only to net SR +0.57 / DSR
+0.737 — real progress, still shy of the 0.95 gate. Costs here remain a **lower
+bound** (slippage still deferred, design doc §4.3), so net results can only worsen
+from here; the remaining headroom is more turnover control (wider buffer, longer
+horizon) and eventually a slippage/impact study on the surviving cell.
 
 ## Artifacts (gitignored `data/trial_database/`)
 
 | File | Contents |
 |---|---|
-| `production_dsr_matrix.parquet` | current ledger — daily-only N=3 (net) |
-| `production_dsr_matrix_net12.parquet` | archived full 12-cell NET ledger |
-| `production_dsr_matrix_dsr_gate.csv` | latest DSR gate output (N=3 daily) |
-| `tree_fit_diagnostics_{15min,30min,60min,daily}.csv` | per-model rank-IC diagnostics (§1) |
+| `production_dsr_matrix.parquet` | current ledger — daily-only N=3, **5-day target** (net, §5) |
+| `production_dsr_matrix_daily5b.parquet` | archived daily N=3 NET ledger — 5-day target (§5) |
+| `production_dsr_matrix_daily1b.parquet` | archived daily N=3 NET ledger — 1-day target (§4) |
+| `production_dsr_matrix_net12.parquet` | archived full 12-cell NET ledger (§3) |
+| `production_dsr_matrix_dsr_gate.csv` | latest DSR gate output |
+| `tree_fit_diagnostics_{15min,30min,60min,daily}.csv` | per-model rank-IC diagnostics, 1-day (§1) |
+| `tree_fit_diagnostics_daily_5b.csv` | daily per-model rank-IC diagnostics, 5-day target (§5) |
+| `production_sensitivity_dsr_matrix.parquet` | sensitivity-scan ledger — buffer-width band (§6) |
