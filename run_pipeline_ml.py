@@ -42,7 +42,12 @@ from src.production_ml.feature_creator import (
     CLOSE_COL,
     create_features,
 )
-from src.production_ml.tier1_trees import TreeAlphaEngine, DECILE_PCT, WalkForwardResult
+from src.production_ml.tier1_trees import (
+    TreeAlphaEngine,
+    DECILE_PCT,
+    DEFAULT_TARGET,
+    WalkForwardResult,
+)
 from src.production_ml.tier2_regime import (
     RegimeDetector,
     RegimeResult,
@@ -63,8 +68,10 @@ _LIVE_MARKET: Final[str] = "live_nse"
 _LIVE_LOOKBACK: Final[int] = 0
 
 # The frozen base config for [SENSITIVITY] scans (phase3 R5: freeze before test).
+# Anchored on the headline survivor — daily long_only — so a buffer/threshold scan
+# probes the robustness of the cell we actually report, not an off-strategy one.
 SENSITIVITY_BASE: Final[dict] = dict(
-    frequency="daily", execution_style="dynamic_tilt", decile_pct=DECILE_PCT,
+    frequency="daily", execution_style="long_only", decile_pct=DECILE_PCT,
     rebalance_buffer_mult=2.0,
 )
 
@@ -103,7 +110,9 @@ def load_ohlcv_multiindex(frequency: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Per-frequency signal computation (the expensive stages — cached across styles)
 # --------------------------------------------------------------------------- #
-def compute_signals(frequency: str, decile_pct: float) -> tuple[WalkForwardResult, pd.DataFrame]:
+def compute_signals(
+    frequency: str, decile_pct: float, target_col: str = DEFAULT_TARGET
+) -> tuple[WalkForwardResult, pd.DataFrame]:
     """Tier 1 tree walk-forward for one frequency. Returns (wf_result, price_wide)."""
     bars = load_ohlcv_multiindex(frequency)
     features = create_features(bars, frequency)
@@ -113,7 +122,9 @@ def compute_signals(frequency: str, decile_pct: float) -> tuple[WalkForwardResul
     price_wide = bars[CLOSE_COL].unstack(level=TICKER_LEVEL)
     del bars
     gc.collect()
-    engine = TreeAlphaEngine.from_frequency(frequency, decile_pct=decile_pct)
+    engine = TreeAlphaEngine.from_frequency(
+        frequency, target_col=target_col, decile_pct=decile_pct
+    )
     wf = engine.run_walk_forward(features)
     return wf, price_wide
 
@@ -154,7 +165,8 @@ def build_headline_grid(frequencies: list[str], styles: list[str]) -> list[Strat
 
 
 def run_headline_grid(
-    frequencies: list[str], styles: list[str], skip_dsr: bool = False
+    frequencies: list[str], styles: list[str], skip_dsr: bool = False,
+    target_col: str = DEFAULT_TARGET,
 ) -> None:
     configs = build_headline_grid(frequencies, styles)
 
@@ -174,8 +186,9 @@ def run_headline_grid(
     # Tier 1 once per frequency; fan out Tier 3 + Tier 4 across styles.
     for frequency in frequencies:
         print(f"\n{DIVIDER}\n  FREQUENCY: {frequency}\n{DIVIDER}")
-        print(f"[Tier 1] Tree walk-forward (decile_pct={DECILE_PCT}) — once for {frequency}")
-        wf, price_wide = compute_signals(frequency, DECILE_PCT)
+        print(f"[Tier 1] Tree walk-forward (decile_pct={DECILE_PCT}, "
+              f"target={target_col}) — once for {frequency}")
+        wf, price_wide = compute_signals(frequency, DECILE_PCT, target_col=target_col)
         _persist_ic(wf, frequency)
 
         for style in styles:
@@ -207,7 +220,7 @@ def run_headline_grid(
 # --------------------------------------------------------------------------- #
 # Sensitivity scan (phase3 R3) — separate entrypoint, separate ledger
 # --------------------------------------------------------------------------- #
-def run_sensitivity(axis: str) -> None:
+def run_sensitivity(axis: str, target_col: str = DEFAULT_TARGET) -> None:
     if axis not in config.SENSITIVITY_BANDS:
         raise ValueError(
             f"axis={axis!r} not in SENSITIVITY_BANDS {sorted(config.SENSITIVITY_BANDS)}"
@@ -217,7 +230,8 @@ def run_sensitivity(axis: str) -> None:
 
     print(DIVIDER)
     print(f"  PRODUCTION_ML SENSITIVITY SCAN — axis={axis} over {band}")
-    print(f"  frozen base: {base} | hmm_states={config.HEADLINE_HMM_STATES}")
+    print(f"  frozen base: {base} | target={target_col} | "
+          f"hmm_states={config.HEADLINE_HMM_STATES}")
     print(DIVIDER)
 
     # Regime features (daily) built once; the HMM is cheap (~seconds). For a
@@ -240,7 +254,9 @@ def run_sensitivity(axis: str) -> None:
 
         key = (frequency, decile_pct)
         if key not in signal_cache:
-            signal_cache[key] = compute_signals(frequency, decile_pct)
+            signal_cache[key] = compute_signals(
+                frequency, decile_pct, target_col=target_col
+            )
         wf, price_wide = signal_cache[key]
 
         if axis == "panic_threshold":
@@ -348,6 +364,11 @@ def main() -> None:
              "optionally pass a ledger path (default: the production ledger)",
     )
     parser.add_argument(
+        "--target", default=DEFAULT_TARGET, metavar="COL",
+        help="tree learning target column (e.g. tgt_fwd_logret_1b or "
+             "tgt_fwd_logret_5b — a slower 5-day signal cuts turnover)",
+    )
+    parser.add_argument(
         "--skip-dsr", action="store_true",
         help="skip the auto-DSR gate at the end of the grid (for per-frequency "
              "partial runs, whose len(configs) is the wrong N); run `--dsr` "
@@ -358,9 +379,12 @@ def main() -> None:
     if args.dsr is not None:
         run_dsr_gate(args.dsr)
     elif args.sensitivity:
-        run_sensitivity(args.sensitivity)
+        run_sensitivity(args.sensitivity, target_col=args.target)
     else:
-        run_headline_grid(args.frequencies, args.styles, skip_dsr=args.skip_dsr)
+        run_headline_grid(
+            args.frequencies, args.styles, skip_dsr=args.skip_dsr,
+            target_col=args.target,
+        )
 
 
 if __name__ == "__main__":
