@@ -211,6 +211,71 @@ picking the band's max on the OOS Sharpe is precisely the selection-on-test-stat
 bias the DSR gate corrects (phase3 §0). Turnover control unambiguously helps — raw
 deciles (mult 1.0, Sharpe 0.302) are the worst cell in the band.
 
+## 7. POST-HOC — beta decomposition & the panic-gate dead-end
+
+Two follow-up studies on the headline survivor (daily long_only, 5-day target, net).
+Both are **read-only diagnostics on the existing ledger** except §7.3, which was a
+single tested-and-reverted gate variant. Market series = NIFTY-50 daily close,
+**forward-aligned** to the ledger's T→T+1 return convention (a 1-bar lag otherwise
+spuriously zeroes beta: contemporaneous R²=0.00 vs forward-aligned R²=0.15).
+
+### 7.1 Alpha/beta — how much is skill vs market exposure
+
+Regress each daily net series on NIFTY-50: `r = alpha + beta·r_mkt + eps`.
+
+| style | alpha/yr | alpha t-stat | beta | R² | raw SR | beta-hedged SR |
+|---|---|---|---|---|---|---|
+| **long_only** | +7.6% | **0.81** | **0.586** | 0.15 | 0.57 | **0.31** |
+| long_short | −4.5% | −0.46 | −0.022 | 0.00 | −0.19 | −0.17 |
+| dynamic_tilt | +1.8% | 0.14 | 0.668 | 0.11 | 0.30 | 0.05 |
+
+**Read:** long_only is *not* a pure beta bet (β 0.59, cash 19% of days) but it isn't
+market-neutral either — **~half its Sharpe (0.57→0.31 hedged) is market beta** that a
+bull sample flatters. The residual skill is positive but **statistically insignificant**
+(alpha t 0.81 « 2) — the same verdict the DSR gate returns. long_short (β≈0, the pure
+cross-sectional signal) has *negative* net alpha; dynamic_tilt is almost all beta.
+
+### 7.2 Drawdown behavior — where the gate helps and where it doesn't
+
+Cumulative net return of daily long_only through named crisis windows (old/production gate):
+
+| window | NIFTY-50 | long_only |
+|---|---|---|
+| 2018 midcap/NBFC (Feb–Oct 18) | −0.1% | **−36.5%** |
+| COVID crash (Jan–Mar 20) | −35.8% | **−1.1%** |
+| COVID + recovery (→Aug 20) | −6.0% | **+25.3%** |
+| 2022 rate grind (Oct 21–Jun 22) | −16.8% | **−32.7%** |
+
+The gate protects **sharp, index-wide crashes** (COVID −36% → −1%, then +25% incl.
+rebound) but **not** (a) size-localized selloffs where NIFTY-50 is flat while the
+mid/small-cap book collapses (2018), nor (b) slow grinds the relative percentile never
+trips on (2022).
+
+### 7.3 Multi-scale panic gate — TESTED AND REJECTED
+
+Hypothesis (from §7.2): the 2018 miss was the gate sensing risk on **NIFTY-50** while the
+book trades mid/small-caps. Fix tried: make the gate's stress a skip-missing mean of
+z-realized-vol across **three scales** — NIFTY-50, NIFTY-MIDCAP-150 (lists 2019-07), and an
+equal-weight basket of the 68 traded stocks — plus the existing herding term. HMM states
+left untouched (verified byte-identical); only the gate changed. Re-ran daily 5b net.
+
+| metric | old gate (NIFTY-50 only) | multi-scale gate |
+|---|---|---|
+| net SR / DSR | 0.57 / 0.737 | **0.44 / 0.631** |
+| net CumRet | +123% | +76% |
+| COVID crash window | −1.1% | **−10.3%** |
+| 2018 window | −36.5% | −40.0% |
+| cash (de-risk) days | 324 | 273 |
+
+**Refuted — reverted.** The multi-scale gate degraded every window and *broke the COVID
+protection*: adding scales to a **relative top-15% percentile** reshuffled which days rank
+"most stressed," pulling the trigger away from the real crashes. Deeper cause: **2018 was
+never a gate-blindness problem** — the old gate already tripped **26% of 2018 days** yet the
+book still lost −36.5%. A de-risk gate can only reach cash (0%); it cannot make a **net-long
+book (β 0.59, §7.1)** profit while its universe falls −36%. **Gating is not the lever.** The
+edge's thinness — not its drawdowns — is what fails the DSR gate, so the levers remain
+breadth / features / horizon (presentation notes §4), not gate engineering.
+
 ## Key finding
 
 The signal has **real cross-sectional predictive skill** (§1, IC 0.02–0.09) but the
