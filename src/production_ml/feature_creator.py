@@ -250,6 +250,50 @@ def _rank_normalize(feats: pd.DataFrame) -> pd.DataFrame:
     return normed.mask(single, 0.0)
 
 
+def _apply_universe_mask(
+    raw: pd.DataFrame, universe_mask: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Blank out features for names outside that date's tradeable universe.
+
+    Applied **between** the rolling stage and rank-normalization, and the ordering is
+    the entire point. Each name's rolling statistics must still be computed on its own
+    full history — a stock that entered the universe last quarter has a real 252-day
+    volatility, and masking before the rolling stage would truncate it. But the
+    cross-sectional rank has to be taken over *only* the names that were actually
+    tradeable that day, or the normalized values encode a peer group the strategy could
+    never have held.
+
+    Masked cells become NaN and are dropped by the existing all-features-present rule,
+    so an out-of-universe bar never reaches the trees at all.
+
+    Args:
+        raw: MultiIndex ('date', 'ticker') frame of un-normalized features.
+        universe_mask: wide (date × ticker) boolean frame. Absent dates or tickers are
+            treated as out-of-universe — a mask that does not mention a name is not
+            evidence that the name was tradeable.
+    """
+    flags = (
+        universe_mask.astype(bool)
+        .stack()
+        .rename_axis([DATE_LEVEL, TICKER_LEVEL])
+        .reindex(raw.index)
+        .fillna(False)
+        .to_numpy()
+    )
+    kept = int(flags.sum())
+    print(
+        f"[feature_creator] universe mask: {kept:,} of {len(raw):,} bars in universe "
+        f"({kept / max(len(raw), 1):.1%})"
+    )
+    if kept == 0:
+        raise ValueError(
+            "universe_mask excluded every bar — check that its dates and tickers "
+            "match the price panel (a tz-aware/naive mismatch does exactly this)"
+        )
+    return raw.where(pd.Series(flags, index=raw.index), np.nan)
+
+
 def _compute_targets(df: pd.DataFrame, null_cross_session: bool) -> pd.DataFrame:
     """
     Forward log-return labels over ``TARGET_HORIZONS`` bars (never fed as features).
@@ -280,7 +324,9 @@ def _compute_targets(df: pd.DataFrame, null_cross_session: bool) -> pd.DataFrame
 
 
 def create_features(
-    augmented_df: pd.DataFrame, frequency: str = config.DEFAULT_FREQUENCY
+    augmented_df: pd.DataFrame,
+    frequency: str = config.DEFAULT_FREQUENCY,
+    universe_mask: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Build the normalized feature matrix + forward-return targets for one frequency.
@@ -293,6 +339,12 @@ def create_features(
         frequency:    a key in ``config.FREQ_REGISTRY``. Determines whether the
             institutional family is expected and whether forward targets are
             nulled at session boundaries (intraday only).
+        universe_mask: optional wide (date × ticker) boolean point-in-time universe.
+            When given, rolling features are still computed on each name's full
+            history but the cross-sectional rank-normalization — and therefore the
+            emitted rows — are restricted to that date's tradeable set. ``None``
+            (the default) leaves behaviour byte-for-byte identical to Phase 2/3, so
+            the published results stay reproducible.
 
     Returns:
         MultiIndex ('date', 'ticker') DataFrame with the feature columns (19, or
@@ -319,6 +371,8 @@ def create_features(
     df = augmented_df.sort_index()
 
     raw = _compute_raw_features(df, with_institutional)
+    if universe_mask is not None:
+        raw = _apply_universe_mask(raw, universe_mask)
     normed = _rank_normalize(raw)
     targets = _compute_targets(df, null_cross_session)
 

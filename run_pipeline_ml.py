@@ -30,6 +30,8 @@ other knobs are frozen at SENSITIVITY_BASE before the scan (freeze-before-test).
 import argparse
 import gc
 import itertools
+import os
+from dataclasses import replace
 from typing import Final
 
 import pandas as pd
@@ -61,6 +63,11 @@ DIVIDER: Final[str] = "=" * 72
 PRODUCTION_LEDGER: Final[str] = "data/trial_database/production_dsr_matrix.parquet"
 SENSITIVITY_LEDGER: Final[str] = "data/trial_database/production_sensitivity_dsr_matrix.parquet"
 DIAGNOSTICS_PATH_TMPL: Final[str] = "data/trial_database/tree_fit_diagnostics_{frequency}.csv"
+
+# Frequencies served by the Phase 4 point-in-time panel (src/phase4_data/). These carry
+# a universe mask, delisting exits, and their own regime panel; the Phase 2/3 entries do
+# not, and the two families cannot share a run.
+PHASE4_FREQUENCIES: Final[frozenset[str]] = frozenset({"daily_nse500"})
 
 # Frozen defaults for every sandbox-only StrategyConfig field (meaningless in
 # PRODUCTION_ML, but the shared dataclass requires them / hashes them into the id).
@@ -110,12 +117,67 @@ def load_ohlcv_multiindex(frequency: str) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Per-frequency signal computation (the expensive stages — cached across styles)
 # --------------------------------------------------------------------------- #
+def is_phase4(frequency: str) -> bool:
+    """True for frequencies served by the Phase 4 point-in-time panel."""
+    return frequency in PHASE4_FREQUENCIES
+
+
+def load_universe_mask(frequency: str) -> pd.DataFrame | None:
+    """
+    Point-in-time universe mask for a Phase 4 frequency, else None.
+
+    Missing on a Phase 4 frequency is a hard error rather than a silent fallback: a
+    run without the mask would rank each name against every listed stock instead of
+    the tradeable 500, which is a different (and untradeable) experiment that would
+    otherwise be indistinguishable in the output.
+    """
+    if not is_phase4(frequency):
+        return None
+    path = config.ML_CONFIG.phase4.universe_mask_parquet
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found — run src/phase4_data/universe.py --build before a "
+            f"{frequency} run."
+        )
+    mask = pd.read_parquet(path)
+    mask.index = pd.DatetimeIndex(mask.index).normalize()
+    return mask
+
+
+def load_terminal_returns(frequency: str) -> pd.Series | None:
+    """Ticker → delisting/acquisition exit return for a Phase 4 frequency, else None."""
+    if not is_phase4(frequency):
+        return None
+    path = config.ML_CONFIG.phase4.lifecycle_csv
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found — run src/phase4_data/bhavcopy_panel.py --build first."
+        )
+    life = pd.read_csv(path)
+    return life.set_index("ticker")["terminal_return"].dropna()
+
+
+def phase4_regime_config():
+    """
+    A ``_RegimeConfig`` pointed at the Phase 4 index and stock panels.
+
+    Tier 2 needs no code change — both Phase 4 artefacts are emitted in the schema its
+    loaders already expect, so repointing the two paths is the whole integration.
+    """
+    p4 = config.ML_CONFIG.phase4
+    return replace(
+        config.ML_CONFIG.regime,
+        index_parquet=p4.index_parquet,
+        stock_parquet=p4.ohlcv_parquet,
+    )
+
+
 def compute_signals(
     frequency: str, decile_pct: float, target_col: str = DEFAULT_TARGET
 ) -> tuple[WalkForwardResult, pd.DataFrame]:
     """Tier 1 tree walk-forward for one frequency. Returns (wf_result, price_wide)."""
     bars = load_ohlcv_multiindex(frequency)
-    features = create_features(bars, frequency)
+    features = create_features(bars, frequency, universe_mask=load_universe_mask(frequency))
     # Extract the (small) price panel now, then drop the ~4M-row raw OHLCV frame
     # so it is not resident during the memory-critical walk-forward tree loop.
     # price_wide does not depend on the walk-forward, so this reorder is safe.
@@ -129,9 +191,26 @@ def compute_signals(
     return wf, price_wide
 
 
-def compute_regime(hmm_states: int) -> RegimeResult:
-    """Tier 2 market-regime HMM — daily, frequency-independent, computed once."""
-    return RegimeDetector(n_states=hmm_states).fit_predict(build_regime_features())
+def compute_regime(hmm_states: int, frequencies: list[str] | None = None) -> RegimeResult:
+    """
+    Tier 2 market-regime HMM — daily, frequency-independent, computed once.
+
+    The regime is market-wide, so one fit serves every cell in a run. It does depend on
+    *which* market panel is in play, though: a Phase 4 run must decode regimes over the
+    2013→2025 NSE-500 history rather than the 68-name 2015→2025 one, or the panic gate
+    would be undefined across the added years. Mixing Phase 3 and Phase 4 frequencies in
+    one run is therefore rejected rather than silently resolved.
+    """
+    freqs = frequencies or []
+    p4 = [f for f in freqs if is_phase4(f)]
+    if p4 and len(p4) != len(freqs):
+        raise ValueError(
+            f"cannot mix Phase 4 {p4} and Phase 2/3 {[f for f in freqs if f not in p4]} "
+            "frequencies in one run — they need different regime panels. Run them "
+            "separately."
+        )
+    cfg = phase4_regime_config() if p4 else config.ML_CONFIG.regime
+    return RegimeDetector(n_states=hmm_states).fit_predict(build_regime_features(cfg))
 
 
 def _persist_ic(wf: WalkForwardResult, frequency: str) -> None:
@@ -180,7 +259,7 @@ def run_headline_grid(
 
     # Tier 2 once for the whole run (regime is daily, frequency-independent).
     print(f"\n[Tier 2] Market-regime HMM (n_states={config.HEADLINE_HMM_STATES}) — once")
-    regime = compute_regime(config.HEADLINE_HMM_STATES)
+    regime = compute_regime(config.HEADLINE_HMM_STATES, frequencies)
     panic = regime.panic
 
     # Tier 1 once per frequency; fan out Tier 3 + Tier 4 across styles.
@@ -190,11 +269,14 @@ def run_headline_grid(
               f"target={target_col}) — once for {frequency}")
         wf, price_wide = compute_signals(frequency, DECILE_PCT, target_col=target_col)
         _persist_ic(wf, frequency)
+        terminal = load_terminal_returns(frequency)
 
         for style in styles:
             cfg = make_ml_config(frequency, style)
             print(f"\n[Tier 3] {frequency} | {style}")
-            returns = execute_ml_strategy(wf, panic, price_wide, cfg)
+            returns = execute_ml_strategy(
+                wf, panic, price_wide, cfg, terminal_returns=terminal
+            )
             # Compound intraday bars to daily BEFORE logging so every frequency
             # shares the ledger's daily index. Without this, intraday bar
             # timestamps miss the daily index labels and the column lands all-NaN

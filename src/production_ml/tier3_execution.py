@@ -240,6 +240,72 @@ def _align_panic(panic: pd.Series, bar_index: pd.Index, frequency: str) -> pd.Se
     return bcast > 0.5
 
 
+def apply_terminal_returns(
+    fwd: pd.DataFrame,
+    price_wide: pd.DataFrame,
+    terminal_returns: pd.Series,
+) -> pd.DataFrame:
+    """
+    Give every delisted name an explicit exit return on its final bar.
+
+    Without this the panel leaks survivorship back in through the exit. A delisted
+    name's last bar has no T+1 price, so its forward return is NaN — and because
+    ``.sum()`` skips NaN, a position held into a delisting is silently realized at
+    **exactly 0%**. The strategy would take every delisting for free, which is the
+    single most flattering bug a survivorship-free panel can still have.
+
+    Only names whose last quote precedes the end of the sample are filled; a NaN on
+    the final bar of the panel means "the backtest ended", not "the company died".
+
+    Args:
+        fwd: (bar × ticker) forward returns, already aligned to the scored bars.
+        price_wide: full (bar × ticker) price history, used to find each name's
+            last quote — ``fwd`` alone cannot distinguish a delisting from the
+            edge of the scored window.
+        terminal_returns: ticker → exit return (−0.30 for a delisting, 0.0 for an
+            acquisition; see ``bhavcopy_panel.classify_lifecycle``).
+    """
+    out = fwd.copy()
+    sample_end = price_wide.index[-1]
+    n_filled = 0
+
+    for ticker, ret in terminal_returns.dropna().items():
+        if ticker not in out.columns:
+            continue
+        last = price_wide[ticker].last_valid_index()
+        if last is None or last >= sample_end or last not in out.index:
+            continue
+        out.at[last, ticker] = float(ret)
+        n_filled += 1
+
+    print(f"[tier3] terminal returns applied to {n_filled} delisted/acquired names")
+    return out
+
+
+def assert_no_implicit_exit(weights: pd.DataFrame, fwd: pd.DataFrame) -> None:
+    """
+    Fail loudly if any held position would be realized at an implicit 0%.
+
+    This is the guard that keeps the leak closed: a weight on a bar whose forward
+    return is NaN contributes nothing to the sum, which reads as a flat exit. The
+    final bar is exempt — there is genuinely no next price for anything there.
+    """
+    if len(weights) < 2:
+        return
+    held = weights.iloc[:-1].abs() > 0
+    unpriced = fwd.iloc[:-1].isna()
+    bad = held & unpriced
+    n_bad = int(bad.to_numpy().sum())
+    if n_bad:
+        where = bad.stack()
+        where = where[where]
+        sample = ", ".join(f"{t} @ {d.date()}" for d, t in where.index[:5])
+        raise AssertionError(
+            f"{n_bad} held position(s) have no forward return and would exit at an "
+            f"implicit 0% — supply terminal_returns for these names. First: {sample}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Strategy execution
 # --------------------------------------------------------------------------- #
@@ -248,6 +314,7 @@ def execute_ml_strategy(
     panic: pd.Series,
     price_wide: pd.DataFrame,
     cfg: StrategyConfig,
+    terminal_returns: pd.Series | None = None,
 ) -> pd.Series:
     """
     Realize one PRODUCTION_ML strategy's portfolio return series.
@@ -258,6 +325,10 @@ def execute_ml_strategy(
                     intraday frequencies.
         price_wide: (bar x ticker) close prices for ``cfg.frequency``.
         cfg:        StrategyConfig (execution_style, frequency).
+        terminal_returns: optional ticker -> exit return for names that leave the
+                    exchange mid-sample. Supplied by the Phase 4 point-in-time
+                    panel; ``None`` (the default) keeps the Phase 2/3 behaviour on
+                    the 68-name panel, where no name delists inside the window.
 
     Returns:
         Net portfolio return per bar, indexed by bar timestamp, NaN-free.
@@ -283,6 +354,13 @@ def execute_ml_strategy(
     common: pd.Index = weights.index.intersection(forward_returns.index)
     weights = weights.loc[common]
     fwd: pd.DataFrame = forward_returns.reindex(index=common, columns=weights.columns)
+
+    # Delisting exits. Without this a position held into a delisting is realized at
+    # an implicit 0% (see apply_terminal_returns), quietly restoring the survivorship
+    # bias the point-in-time panel exists to remove.
+    if terminal_returns is not None:
+        fwd = apply_terminal_returns(fwd, price_wide, terminal_returns)
+        assert_no_implicit_exit(weights, fwd)
 
     # min_count=1 keeps an all-NaN row (last bar, no T+1 price) as NaN so dropna
     # removes it cleanly rather than collapsing it to 0.0.
