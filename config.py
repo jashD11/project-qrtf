@@ -45,6 +45,15 @@ FREQ_REGISTRY: dict[str, _FreqSpec] = {
     "30min": _FreqSpec("data/30min_ohlcv.parquet", 13, 504, 63, True),
     "60min": _FreqSpec("data/60min_ohlcv.parquet", 7, 504, 63, True),
     "daily": _FreqSpec("data/daily_ohlcv.parquet", 1, 504, 63, True),
+    # Phase 4: the rebuilt point-in-time NSE panel (~500 names, 2013→2025) from
+    # src/phase4_data/. Bhavcopy is daily-only, so there is no intraday counterpart —
+    # acceptable, since every intraday cell already died on costs in Phase 3. The four
+    # entries above are left untouched so the Phase 3 headline stays reproducible.
+    # has_institutional=False: the delivery archive only starts in 2020 and
+    # create_features drops rows with any NaN feature, so enabling it would silently
+    # truncate a 12-year panel to 5. Same 17 price-only features as Phase 3, which also
+    # keeps the 68-name vs 500-name comparison like-for-like.
+    "daily_nse500": _FreqSpec("data/nse500_daily_ohlcv.parquet", 1, 504, 63, False),
 }
 
 DEFAULT_FREQUENCY: str = "daily"
@@ -198,6 +207,37 @@ class _DSRConfig:
 
 
 @dataclass
+class _Phase4Config:
+    """
+    Phase 4 point-in-time database (src/phase4_data/). Additive: nothing here affects
+    a Phase 2/3 run, which keeps using the 68-name Drive panel and leaves every field
+    below unread.
+    """
+    # Acquisition window. 2013-01-01 is the later of two hard archive boundaries —
+    # ISIN (the survivorship key) starts in 2012, but the index archive, which Tier 2
+    # needs across the whole panel, only starts 2013-01-02.
+    start_date: str = "2013-01-01"
+    end_date: str = "2025-06-30"
+    request_delay_s: float = 2.5       # empirically reliable pacing; see the module
+
+    raw_dir: str = "data/bhavcopy"
+    panel_parquet: str = "data/bhavcopy/panel_daily.parquet"
+    lifecycle_csv: str = "data/bhavcopy/lifecycle.csv"
+    index_parquet: str = "data/bhavcopy/index_daily.parquet"
+    ohlcv_parquet: str = "data/nse500_daily_ohlcv.parquet"
+    universe_mask_parquet: str = "data/nse500_universe_mask.parquet"
+
+    top_n: int = 500                   # names per quarterly rebalance
+    universe_lookback: int = 252       # trailing window for the liquidity rank
+    universe_min_traded: int = 200     # of the lookback, days that must have traded
+
+    # Terminal return for a name that leaves the exchange without evidence of a
+    # buyout (Shumway 1997). Declared a-priori as a {0, -0.30, -1.00} sensitivity on
+    # a SEPARATE ledger — freeze-before-test, like the rebalance-buffer sweep.
+    delisting_return: float = -0.30
+
+
+@dataclass
 class _MLConfig:
     lgbm: _LGBMConfig = field(default_factory=_LGBMConfig)
     xgb: _XGBConfig = field(default_factory=_XGBConfig)
@@ -206,6 +246,7 @@ class _MLConfig:
     execution: _ExecutionConfig = field(default_factory=_ExecutionConfig)
     cost: _NSECostConfig = field(default_factory=_NSECostConfig)
     dsr: _DSRConfig = field(default_factory=_DSRConfig)
+    phase4: _Phase4Config = field(default_factory=_Phase4Config)
 
 
 ML_CONFIG: _MLConfig = _MLConfig()
