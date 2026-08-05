@@ -167,9 +167,40 @@ class _NSECostConfig:
     sebi_bps: float = 0.01              # SEBI turnover fee (0.0001%)
     stamp_duty_bps_buy: float = 1.5     # stamp duty 0.015%, BUY side only (delivery)
     gst_pct: float = 18.0               # GST on (brokerage + exchange + SEBI)
-    slippage_bps: float = 0.0           # market-impact / half-spread — DEFERRED
-                                        # (see design doc); 0 for now
+    slippage_bps: float = 0.0           # FLAT market-impact / half-spread add-on. Still
+                                        # 0: the size-dependent term below supersedes it
+                                        # and is not yet wired into the execution path.
     short_borrow_bps_annual: float = 50.0  # annual borrow on the short leg's gross
+
+    # --- size-dependent market impact (used by src/phase4_data/capacity.py) --- #
+    # Square-root impact law, the shape docs/phase3_design_requirements.md §4.3 specifies
+    # ("participation rate, spread, ADV, not a flat constant"):
+    #
+    #     impact_bps = 1e4 * impact_coef * sigma * sqrt(participation)
+    #
+    # `impact_coef` is THE discretionary knob in the whole cost stack — every other line
+    # item is a citable statutory rate, this one is a modelling choice. 0.5 puts a 1%-of-
+    # ADV trade in a 2%-daily-vol stock at ~10 bps, which is the right order for Indian
+    # cash equities. Treat it as an assumption to be sensitivity-tested, not a fact.
+    impact_coef: float = 0.5
+    max_participation: float = 0.10     # share of ADV a single position may consume
+    adv_window: int = 21                # trailing bars for the ADV estimate
+
+    @staticmethod
+    def impact_bps(sigma: float, participation: float, coef: float = 0.5) -> float:
+        """
+        Market impact in bps for one trade, from daily vol and participation rate.
+
+        Kept as a pure function so the capacity study and the (later) tier-3 integration
+        share one formula instead of two copies that drift apart. Both arguments are
+        fractions, not percentages: sigma=0.02 is 2% daily vol, participation=0.01 is 1%
+        of average daily volume.
+        """
+        import math
+
+        if participation <= 0 or sigma <= 0:
+            return 0.0
+        return 1e4 * coef * sigma * math.sqrt(participation)
 
     def compose_oneway_bps(self) -> float:
         """
