@@ -41,10 +41,20 @@ Usage
 
 import argparse
 import os
+import sys
 from typing import Final
 
 import numpy as np
 import pandas as pd
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# Canonical implementation lives in the panel builder, which now applies it BEFORE
+# classify_lifecycle so every artefact shares one ticker namespace. Imported here only
+# as a safety net: on an already-disambiguated panel it is a no-op.
+from src.phase4_data.bhavcopy_panel import resolve_tickers
 
 DEFAULT_PANEL: Final[str] = "data/bhavcopy/panel_daily.parquet"
 DEFAULT_MASK: Final[str] = "data/nse500_universe_mask.parquet"
@@ -56,34 +66,6 @@ REBALANCE_EVERY: Final[int] = 63  # matches ML_CONFIG PREDICT_WINDOW (1 quarter)
 MIN_TRADED: Final[int] = 200      # of LOOKBACK days, how many must have actually traded
 
 OHLCV_COLS: Final[list[str]] = ["open", "high", "low", "close", "volume"]
-
-
-def resolve_tickers(panel: pd.DataFrame) -> pd.DataFrame:
-    """
-    Guarantee a one-to-one ISIN↔ticker map.
-
-    ``bhavcopy_panel`` sets ``ticker`` to each ISIN's last observed symbol, which is
-    almost always unique — but NSE does re-issue a symbol after a delisting, and two
-    different companies sharing one column name downstream would silently merge two
-    price series. Collisions are broken deterministically by ISIN so the outcome does
-    not depend on row order, and reported rather than fixed quietly.
-    """
-    out = panel.copy()
-    pairs = out[["isin", "ticker"]].drop_duplicates()
-    dup_names = pairs["ticker"].value_counts()
-    dup_names = dup_names[dup_names > 1]
-    if len(dup_names) == 0:
-        return out
-
-    print(f"[universe] WARN: {len(dup_names)} symbol(s) reused across ISINs — disambiguating")
-    rename: dict[str, str] = {}
-    for name in dup_names.index:
-        isins = sorted(pairs.loc[pairs["ticker"] == name, "isin"])
-        for i, isin in enumerate(isins[1:], start=2):  # first keeps the bare symbol
-            rename[isin] = f"{name}.{i}"
-            print(f"[universe]   {name} ← {isin} → {name}.{i}")
-    out["ticker"] = out["isin"].map(rename).fillna(out["ticker"])
-    return out
 
 
 def rebalance_dates(dates: np.ndarray) -> list[int]:

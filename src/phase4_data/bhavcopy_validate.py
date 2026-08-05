@@ -7,24 +7,31 @@ bonuses are *detected*, not looked up. A missed 1:10 split injects a fake −90%
 straight into the tree's training labels. Detection accuracy is the single largest risk
 in the Phase 4 build, so it gets measured here rather than assumed.
 
-Five gates, of which **only the first is blocking**:
+Six gates. **Gates 1, 5 and 6 are blocking**; 2–4 are diagnostics.
 
     1. REPRODUCTION (blocking).  Rebuild the 68 tickers of the existing verified panel
-       from bhavcopy and compare daily *returns* over the overlap window. Levels are
-       expected to differ — two panels can be back-adjusted from different epochs — but
-       returns cannot. Passes when ≥95% of names clear correlation > 0.999 and median
-       |Δ return| < 1 bp. Failures are listed by name, never averaged away.
-    2. SURVIVORSHIP.  How many of the earliest universe are still listed at the end —
-       the number that quantifies what a survivor-only universe would have hidden.
+       and compare daily *returns*. Levels are expected to differ — two panels can be
+       back-adjusted from different epochs — but returns cannot. Scored in three parts:
+       (1a) typical-day fidelity within a tick-scaled tolerance on ≥95% of qualifying
+       names, (1b) *zero* days where our series shows an impossible return, (1c) overall
+       disagreement ≤0.1%. A mechanical drop rule first disqualifies reference series
+       that are themselves broken — see the threshold block below.
+    2. SURVIVORSHIP.  How many of the panel left the exchange — the number that
+       quantifies what a survivor-only universe would have hidden.
     3. ACTION AUDIT.  The largest detected factors, printed for eyeballing against
        public split/bonus records, plus everything the detector itself flagged.
-    4. RESIDUAL DISCONTINUITY.  Post-adjustment |daily return| > 40% events should fall
-       to roughly the genuine-crash rate; a cluster means missed actions.
-    5. CAUSALITY.  Re-asserts the two invariants the build depends on — back-adjustment
-       leaves historical returns untouched, and universe selection at *t* reads only
-       bars before *t*.
+    4. RESIDUAL DISCONTINUITY.  Panel-wide extreme-return rate, as a distribution check.
+    5. CAUSALITY (blocking).  Re-asserts the two invariants the build depends on —
+       back-adjustment leaves historical returns untouched, and universe selection at
+       *t* reads only bars before *t*.
+    6. RESIDUAL SWEEP (blocking).  **The gate that actually proves the labels are
+       clean.** Gate 1 can only see the 66 names the reference happens to contain — 95%
+       of the universe is invisible to it. Gate 6 asserts an internal property over
+       *every* in-universe bar of all 1,244 names: no impossible return survives
+       adjustment unless a detected action sits within a few bars, or the event is
+       recorded in the audited `known_extremes.csv` register.
 
-Exits non-zero if gate 1 fails, so it can gate the build in a shell pipeline.
+Exits non-zero if any blocking gate fails, so it can gate the build in a shell pipeline.
 
 Usage
     python src/phase4_data/bhavcopy_validate.py
@@ -38,6 +45,13 @@ from typing import Final
 
 import numpy as np
 import pandas as pd
+
+# Run as a script (`python src/phase4_data/bhavcopy_validate.py`) sys.path holds this
+# file's directory, not the repo root, so `import src.phase4_data...` fails. Put the
+# repo root first so the module works both as a script and as an import.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 DEFAULT_PANEL: Final[str] = "data/bhavcopy/panel_daily.parquet"
 DEFAULT_ACTIONS: Final[str] = "data/bhavcopy/corporate_actions.csv"
@@ -76,6 +90,16 @@ DISAGREEMENT_GATE: Final[float] = 0.001    # ≤0.1% of observations may differ 
 MATERIAL_DIFF: Final[float] = 0.05         # what counts as a disagreement day
 CORR_DIAGNOSTIC: Final[float] = 0.999      # reported only, never gates
 MIN_OVERLAP_BARS: Final[int] = 250         # below this a correlation is not meaningful
+
+# Gate 6 (residual sweep) and the mechanical drop rule.
+DEFAULT_REGISTER: Final[str] = os.path.join(os.path.dirname(__file__), "known_extremes.csv")
+WITNESS_BARS: Final[int] = 3               # action-to-event proximity that counts as explained
+MAX_GAP_DAYS: Final[int] = 7               # a return across a suspension is not a discontinuity
+
+# A reference series is disqualified as ground truth when it fails EITHER test. Both are
+# properties of the reference itself, evaluated before any pass rate is computed.
+REF_DRIFT_STEP: Final[float] = 0.01        # level-ratio step that counts as drift …
+REF_DRIFT_FRACTION: Final[float] = 0.05    # … on more than this share of days ⇒ mis-stitched
 
 
 def _naive_dates(s: pd.Series) -> pd.Series:
@@ -139,8 +163,8 @@ def gate_reproduction(
             rows.append({"ticker": t, "bars": len(j), "corr": np.nan,
                          "med_abs_diff": np.nan, "max_abs_diff": np.nan,
                          "n_material": 0, "tol": np.nan, "tick_bps": np.nan,
-                         "our_implausible": False,
-                         "ref_implausible": False, "pass": False})
+                         "our_implausible": False, "ref_implausible": False,
+                         "ref_drift": np.nan, "disqualified": True, "pass": False})
             continue
         d = (j["ref"] - j["new"]).abs()
         material = d > MATERIAL_DIFF
@@ -149,6 +173,19 @@ def gate_reproduction(
         tick_bps = TICK_SIZE_RS / px if px > 0 else np.inf
         # On a disagreement day, whichever side shows a move beyond NSE's circuit
         # limits is the side carrying an unadjusted corporate action.
+        ref_bad = bool((material & (j["ref"].abs() > IMPLAUSIBLE_RETURN)).any())
+
+        # Drift test: if only the LEVEL differs, returns are identical and the level
+        # ratio is flat. A ratio that keeps stepping means the two series are not the
+        # same instrument — a mis-stitched reference history.
+        lv = pd.concat([
+            ref.loc[ref["ticker"] == t].set_index("timestamp")["close"].rename("ref"),
+            ours.loc[ours["ticker"] == t].set_index("date")["close"].rename("new"),
+        ], axis=1).dropna()
+        drift = float(
+            (lv["ref"] / lv["new"]).pct_change().abs().gt(REF_DRIFT_STEP).mean()
+        ) if len(lv) > 1 else 0.0
+
         rows.append({
             "ticker": t,
             "bars": len(j),
@@ -159,7 +196,11 @@ def gate_reproduction(
             "tol": max(MEDIAN_DIFF_GATE, TICK_TOLERANCE * tick_bps),
             "tick_bps": tick_bps,
             "our_implausible": bool((material & (j["new"].abs() > IMPLAUSIBLE_RETURN)).any()),
-            "ref_implausible": bool((material & (j["ref"].abs() > IMPLAUSIBLE_RETURN)).any()),
+            "ref_implausible": ref_bad,
+            "ref_drift": drift,
+            # THE MECHANICAL DROP RULE. Evaluated here, from properties of the reference
+            # alone, before any pass rate exists — so it cannot be tuned to a verdict.
+            "disqualified": ref_bad or drift > REF_DRIFT_FRACTION,
             "pass": False,
         })
     res = pd.DataFrame(rows)
@@ -167,23 +208,41 @@ def gate_reproduction(
         print("  FAIL — no comparable tickers")
         return False, res
 
+    # ── The mechanical drop rule, reported before any pass rate ─────────────────
+    dq = res[res["disqualified"]]
+    print(f"\n  [drop rule] {len(dq)}/{len(res)} reference series disqualified as ground "
+          f"truth (properties of the REFERENCE, evaluated before any pass rate):")
+    for _, r in dq.sort_values("ref_drift", ascending=False).iterrows():
+        why = []
+        if r["ref_implausible"]:
+            why.append(f"impossible day (>{IMPLAUSIBLE_RETURN:.0%}) our panel contradicts")
+        if pd.notna(r["ref_drift"]) and r["ref_drift"] > REF_DRIFT_FRACTION:
+            why.append(f"level ratio drifts on {r['ref_drift']:.0%} of days (mis-stitched)")
+        if not why:
+            why.append(f"only {int(r['bars'])} overlapping bars")
+        print(f"    {r['ticker']:<14}{'; '.join(why)}")
+
+    kept = res[~res["disqualified"]].copy()
+    print(f"  scoring on the {len(kept)} qualifying names")
+
     # ── 1a. Typical-day fidelity, per name ──────────────────────────────────────
     res["pass"] = res["med_abs_diff"] < res["tol"]
-    frac = float(res["pass"].mean())
+    kept = res[~res["disqualified"]]
+    frac = float(kept["pass"].mean()) if len(kept) else 0.0
     ok_a = frac >= PASS_FRACTION_GATE
 
     print(f"\n  [1a] typical-day fidelity — median |Δ return| < "
           f"{TICK_TOLERANCE:.0f} ticks (per-name, price-scaled)")
-    print(f"       {int(res['pass'].sum())}/{len(res)} names = {frac:.1%} "
+    print(f"       {int(kept['pass'].sum())}/{len(kept)} qualifying names = {frac:.1%} "
           f"(gate ≥{PASS_FRACTION_GATE:.0%})  → {'PASS' if ok_a else 'FAIL'}")
-    print(f"       median |Δ return| across names: {res['med_abs_diff'].median():.2e}")
+    print(f"       median |Δ return| across names: {kept['med_abs_diff'].median():.2e}")
 
     # ── 1b. No missed corporate action (the asymmetric test that matters) ───────
     # A missed split leaves an impossible return in OUR series. A reference defect
     # leaves one in THEIRS. Only the former is our problem, and only the former can
     # poison a training label — so the two are counted separately, never netted.
-    ours_bad = int((res["our_implausible"]).sum())
-    theirs_bad = int((res["ref_implausible"]).sum())
+    ours_bad = int(kept["our_implausible"].sum())
+    theirs_bad = int(res["ref_implausible"].sum())
     ok_b = ours_bad == 0
 
     print(f"\n  [1b] missed corporate actions — days where our return exceeds "
@@ -193,8 +252,8 @@ def gate_reproduction(
           f"defects in the reference)")
 
     # ── 1c. Bounded overall disagreement ────────────────────────────────────────
-    n_obs = int(res["bars"].sum())
-    n_dis = int(res["n_material"].sum())
+    n_obs = int(kept["bars"].sum())
+    n_dis = int(kept["n_material"].sum())
     rate = n_dis / max(n_obs, 1)
     ok_c = rate <= DISAGREEMENT_GATE
 
@@ -202,10 +261,10 @@ def gate_reproduction(
     print(f"       {n_dis} of {n_obs:,} observations = {rate:.4%} "
           f"(gate ≤{DISAGREEMENT_GATE:.1%})  → {'PASS' if ok_c else 'FAIL'}")
 
-    print(f"\n  [diagnostic, not gated] median correlation {res['corr'].median():.6f} | "
-          f"names above {CORR_DIAGNOSTIC}: {int((res['corr'] > CORR_DIAGNOSTIC).sum())}/{len(res)}")
+    print(f"\n  [diagnostic, not gated] median correlation {kept['corr'].median():.6f} | "
+          f"names above {CORR_DIAGNOSTIC}: {int((kept['corr'] > CORR_DIAGNOSTIC).sum())}/{len(kept)}")
 
-    bad = res[~res["pass"] | res["our_implausible"]].sort_values("med_abs_diff", ascending=False)
+    bad = kept[~kept["pass"] | kept["our_implausible"]].sort_values("med_abs_diff", ascending=False)
     if len(bad):
         print(f"\n  NAMES FAILING 1a OR 1b ({len(bad)}):")
         for _, r in bad.iterrows():
@@ -213,7 +272,7 @@ def gate_reproduction(
             print(f"    {r['ticker']:<14} bars={int(r['bars']):>5} corr={r['corr']:.5f} "
                   f"med|Δ|={r['med_abs_diff']:.2e} max|Δ|={r['max_abs_diff']:.3f}{flag}")
 
-    worst = res.nlargest(5, "n_material")[["ticker", "n_material", "bars", "corr"]]
+    worst = kept.nlargest(5, "n_material")[["ticker", "n_material", "bars", "corr"]]
     print(f"\n  most disagreement days (diagnostic):")
     for _, r in worst.iterrows():
         print(f"    {r['ticker']:<14} {int(r['n_material']):>3} days of {int(r['bars']):,} "
@@ -315,6 +374,96 @@ def gate_residual_discontinuity(panel: pd.DataFrame, threshold: float = 0.40) ->
         )
 
 
+def gate_residual_sweep(
+    panel: pd.DataFrame, mask_path: str, actions_path: str, register_path: str
+) -> bool:
+    """
+    Gate 6 — every tradeable bar, not just the 66 the reference happens to cover.
+
+    **This is the gate that actually proves the training labels are clean.** Gate 1
+    compares against an external panel and therefore sees 66 of 1,244 names — 95% of the
+    universe is invisible to it. Gate 6 needs no external data at all: it asserts an
+    internal property, that after adjustment no in-universe bar carries a return which is
+    impossible under NSE's circuit limits unless we can say *why*.
+
+    An event passes if either
+      - a detected corporate action sits within ``WITNESS_BARS`` of it, or
+      - it appears in the audited register ``known_extremes.csv`` (genuine news moves,
+        demergers we deliberately do not adjust, sub-floor penny stocks).
+
+    Anything else is an undetected corporate action, i.e. a fake +/-90% training label.
+    A rebuild that produces an unregistered event fails here — the register is a tripwire,
+    not a suppression list.
+    """
+    print("\n" + "=" * 78)
+    print("GATE 6 — RESIDUAL SWEEP, all in-universe bars  [BLOCKING]")
+    print("=" * 78)
+
+    if not os.path.exists(mask_path):
+        print(f"  SKIP — {mask_path} not found (run universe.py --build)")
+        return True
+
+    mask = pd.read_parquet(mask_path)
+    flags = mask.stack()
+    in_universe = set(zip(*[flags[flags].index.get_level_values(i) for i in (0, 1)]))
+
+    df = panel.sort_values(["entity", "date"]).copy()
+    df["ret"] = df.groupby("entity", sort=False)["close"].pct_change()
+    # Only consecutive bars: a return measured across a suspension is not a discontinuity
+    # in the price series, it is an absence of one.
+    df["gap"] = (df["date"] - df.groupby("entity", sort=False)["date"].shift(1)).dt.days
+
+    sub = df[[(d, t) in in_universe for d, t in zip(df["date"], df["ticker"])]]
+    events = sub[(sub["ret"].abs() > IMPLAUSIBLE_RETURN) & (sub["gap"] <= MAX_GAP_DAYS)]
+    print(f"  {len(sub):,} in-universe bars | |return| > {IMPLAUSIBLE_RETURN:.0%}: {len(events)}")
+
+    # Explanation 1 — a detected action nearby.
+    explained_by_action = set()
+    if os.path.exists(actions_path):
+        act = pd.read_csv(actions_path, parse_dates=["date"])
+        cal = pd.DatetimeIndex(np.sort(panel["date"].unique()))
+        pos = pd.Series(range(len(cal)), index=cal)
+        by_entity: dict = {}
+        for e, d in zip(act["entity"], act["date"]):
+            by_entity.setdefault(e, []).append(int(pos[pd.Timestamp(d)]))
+        for idx, r in events.iterrows():
+            i = int(pos[r["date"]])
+            if any(abs(i - x) <= WITNESS_BARS for x in by_entity.get(r["entity"], [])):
+                explained_by_action.add(idx)
+
+    # Explanation 2 — the audited register.
+    registered: set[tuple] = set()
+    if os.path.exists(register_path):
+        reg = pd.read_csv(register_path, comment="#", parse_dates=["date"])
+        registered = set(zip(reg["ticker"], reg["date"]))
+        cats = reg["category"].value_counts().to_dict()
+        print(f"  register: {len(reg)} audited events {cats}")
+    else:
+        print(f"  WARN: register {register_path} not found")
+
+    unexplained = [
+        r for idx, r in events.iterrows()
+        if idx not in explained_by_action and (r["ticker"], r["date"]) not in registered
+    ]
+
+    print(f"  explained by a detected action within +/-{WITNESS_BARS} bars: "
+          f"{len(explained_by_action)}")
+    print(f"  explained by the audited register: "
+          f"{len(events) - len(explained_by_action) - len(unexplained)}")
+    print(f"  UNEXPLAINED: {len(unexplained)}  (gate: 0)")
+
+    if unexplained:
+        print("\n  Each of these is a probable undetected corporate action. Either fix the\n"
+              "  detector, or audit and add it to the register with a reason:")
+        for r in sorted(unexplained, key=lambda x: -abs(x["ret"]))[:25]:
+            print(f"    {str(r['date'].date()):<12}{r['ticker']:<14}{r['ret']:>8.1%}"
+                  f"  close={r['close']:.2f}")
+
+    ok = not unexplained
+    print(f"\n  → GATE 6 {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def gate_causality(panel: pd.DataFrame, mask_path: str) -> bool:
     """Gate 5 — re-assert the two invariants the whole build rests on."""
     print("\n" + "=" * 78)
@@ -376,6 +525,7 @@ def main() -> None:
     ap.add_argument("--lifecycle", default=DEFAULT_LIFECYCLE)
     ap.add_argument("--reference", default=DEFAULT_REFERENCE)
     ap.add_argument("--mask", default=DEFAULT_MASK)
+    ap.add_argument("--register", default=DEFAULT_REGISTER)
     args = ap.parse_args()
 
     if not os.path.exists(args.panel):
@@ -390,9 +540,10 @@ def main() -> None:
     gate_action_audit(args.actions)
     gate_residual_discontinuity(panel)
     causal_ok = gate_causality(panel, args.mask)
+    sweep_ok = gate_residual_sweep(panel, args.mask, args.actions, args.register)
 
     print("\n" + "=" * 78)
-    verdict = repro_ok and causal_ok
+    verdict = repro_ok and causal_ok and sweep_ok
     print(f"VERDICT: {'PASS — cleared for the engine' if verdict else 'FAIL — do not run the engine on this panel'}")
     print("=" * 78)
     if not verdict:

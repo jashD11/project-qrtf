@@ -87,6 +87,16 @@ DEFAULT_INDEX_PARQUET: Final[str] = "data/bhavcopy/index_daily.parquet"
 _EQUITY_ISIN_PREFIX: Final[str] = "INE"
 _KEEP_SERIES: Final[tuple[str, ...]] = ("EQ", "BE")
 
+# Characters 8-9 of an Indian ISIN encode the security type within the issuer:
+#   INE820Y*01*013 = the ordinary equity line
+#   INE820Y*20*013 = a RIGHTS ENTITLEMENT (symbol "AJOONI-RE1"), a separate instrument
+#                    that trades for a handful of days while a rights issue is open.
+# 169 such instruments exist here (~7 bars each, 0.02% of the panel) and none ever
+# reaches the tradeable universe — but they share the issuer stem with the equity line
+# and their few days OVERLAP it, which blocked ISIN linking on 140 stems. Dropping them
+# is both correct (they are not common equity) and what lets link_isins do its job.
+_EQUITY_SECURITY_TYPE: Final[str] = "01"
+
 PANEL_COLUMNS: Final[list[str]] = [
     "date", "isin", "symbol", "series",
     "open", "high", "low", "close", "close_vwap", "volume", "turnover", "trades",
@@ -118,12 +128,19 @@ class ActionConfig:
     Recall therefore matters far more than factor precision, which is why the ratio
     grid stays dense and ``snap_tol`` stays generous enough to absorb a real ex-date
     move rather than rejecting the action outright.
+
+    **``turnover_hi`` was 5.0 and was rejecting real splits.** ELECON 2024-07-19 has a
+    price ratio of 0.5035 — a textbook 1:2 split — and failed on turnover alone at 7.43.
+    A split makes a share cheaper and more accessible, so ex-date *quantity* routinely
+    spikes well past 5x while rupee turnover stays roughly intact. Raised to 20.0; the
+    floor still catches the case the test exists for, a wipeout whose turnover collapses.
     """
     jump: float = 0.25          # |close/close₋₁ − 1| must exceed this
     snap_tol: float = 0.10      # implied ex-date return allowed around the exact ratio
     review_tol: float = 0.05    # above this implied return, flag the row for eyeballing
     turnover_lo: float = 0.20   # rupee turnover vs trailing median: floor …
-    turnover_hi: float = 5.00   # … and ceiling. A split leaves turnover roughly intact.
+    turnover_hi: float = 20.00  # … and ceiling (see below).
+    witness_bars: int = 3       # ISIN-reissue proximity that counts as independent proof
     turnover_window: int = 20
     min_history: int = 5        # skip the first days of a listing (no stable baseline)
     max_gap_days: int = 7       # ignore jumps measured across a break in trading
@@ -266,6 +283,7 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df[
         df["isin"].notna()
         & df["isin"].str.startswith(_EQUITY_ISIN_PREFIX, na=False)
+        & df["isin"].str.slice(7, 9).eq(_EQUITY_SECURITY_TYPE)
         & df["series"].isin(_KEEP_SERIES)
         & df["date"].notna()
         & df["close"].gt(0)
@@ -303,23 +321,34 @@ def link_isins(panel: pd.DataFrame) -> pd.DataFrame:
     spans = out.groupby("isin")["date"].agg(["min", "max"])
     spans["stem"] = spans.index.str[:_ISIN_STEM]
 
-    n_merged = n_overlap = 0
+    n_merged = n_split = 0
     for stem, grp in spans.groupby("stem"):
         if len(grp) < 2:
             continue
         grp = grp.sort_values("min")
-        # Overlap check: each successive listing must start after the previous ends.
-        starts, ends = grp["min"].to_numpy(), grp["max"].to_numpy()
-        if (starts[1:] <= ends[:-1]).any():
-            n_overlap += 1
-            continue
-        canonical = grp.index[0]          # earliest listing keeps the identity
-        out.loc[out["isin"].isin(grp.index), "entity"] = canonical
-        n_merged += len(grp) - 1
+
+        # Walk the listings in time order and merge only while each one starts strictly
+        # after the previous ends. A listing that overlaps is a genuinely co-existing
+        # security (a second share class): it keeps its own identity, and — importantly —
+        # only IT is excluded. An earlier version abandoned the whole stem on any
+        # overlap, which meant one short-lived instrument could block a legitimate
+        # equity-to-equity merge for that company.
+        chain = [grp.index[0]]
+        chain_end = grp["max"].iloc[0]
+        for isin, row in grp.iloc[1:].iterrows():
+            if row["min"] > chain_end:
+                chain.append(isin)
+                chain_end = max(chain_end, row["max"])
+            else:
+                n_split += 1
+
+        if len(chain) > 1:
+            out.loc[out["isin"].isin(chain), "entity"] = chain[0]  # earliest keeps identity
+            n_merged += len(chain) - 1
 
     print(
         f"[panel] ISIN linking: {n_merged} reissue(s) merged into their predecessor | "
-        f"{n_overlap} stem(s) left split (overlapping date ranges = distinct securities)"
+        f"{n_split} listing(s) left separate (overlapping dates = a co-existing security)"
     )
     return out
 
@@ -405,6 +434,31 @@ def _snap(ratio: pd.Series, tol: float) -> pd.Series:
     return pd.Series(out, index=ratio.index)
 
 
+def _isin_reissue_witness(df: pd.DataFrame, window: int) -> pd.Series:
+    """
+    Boolean per row: does an ISIN reissue for this entity fall within ``window`` bars?
+
+    Operates on the entity-sorted frame produced by ``detect_corporate_actions``. A
+    "handover" is the first bar on which an entity trades under a *different* ISIN than
+    the bar before, which ``link_isins`` has already merged into one entity. Marking a
+    symmetric window around it lets a price jump one or two bars away still claim the
+    witness — the reissue and the ex-date rarely land on exactly the same bar.
+    """
+    changed = df["isin"].ne(df.groupby("entity", sort=False)["isin"].shift(1))
+    first_bar = df.groupby("entity", sort=False).cumcount().eq(0)
+    handover = changed & ~first_bar          # a new listing is not a reissue
+
+    if not handover.any():
+        return pd.Series(False, index=df.index)
+
+    # Dilate the handover flag by +/- window bars, per entity, so proximity counts.
+    grp = handover.groupby(df["entity"], sort=False)
+    near = grp.transform(
+        lambda s: s.rolling(2 * window + 1, min_periods=1, center=True).max().astype(bool)
+    )
+    return near.astype(bool)
+
+
 def detect_corporate_actions(
     panel: pd.DataFrame, cfg: ActionConfig = ActionConfig()
 ) -> pd.DataFrame:
@@ -467,12 +521,29 @@ def detect_corporate_actions(
     # since the snap test alone is already a strong filter for a thin-history name.
     to_ok = df["_to_ratio"].between(cfg.turnover_lo, cfg.turnover_hi) | df["_to_ratio"].isna()
 
-    hit = cand & df["_snap"].notna() & to_ok
+    # Tier A — an independent witness. NSE mints a new ISIN when a company changes face
+    # value, which is exactly what a split does, so a reissue within a few bars is
+    # evidence *from outside the price series* that a corporate action happened. Where it
+    # fires, the turnover test is not needed and is skipped: the price jump and the
+    # rational snap already pin down the factor, and turnover was the signal rejecting
+    # real splits (ELECON). The new ISIN usually starts the bar *after* the ex-date
+    # (SBIN: action 2014-11-20, handover 2014-11-21), hence a window rather than equality.
+    #
+    # A witness alone is not sufficient — plenty of reissues are administrative and move
+    # no price at all (EICHERMOT, BDL, AMRUTANJAN all sit at ratio ~1.00 on their handover
+    # date). Requiring the jump and snap tests still filters those out.
+    witnessed = _isin_reissue_witness(df, cfg.witness_bars)
+
+    hit = cand & df["_snap"].notna() & (to_ok | witnessed)
+    df["_witness"] = np.where(witnessed & ~to_ok, "isin_reissue",
+                              np.where(witnessed, "isin_reissue+turnover", "turnover"))
     ledger = (
-        df.loc[hit, ["date", "entity", "isin", "symbol", "_snap", "_ratio", "_to_ratio", "_vol_ratio"]]
+        df.loc[hit, ["date", "entity", "isin", "symbol", "_snap", "_ratio",
+                     "_to_ratio", "_vol_ratio", "_witness"]]
         .rename(columns={
             "_snap": "factor", "_ratio": "price_ratio",
             "_to_ratio": "turnover_ratio", "_vol_ratio": "volume_ratio",
+            "_witness": "witness",
         })
         .sort_values(["date", "entity"])
         .reset_index(drop=True)
@@ -486,15 +557,23 @@ def detect_corporate_actions(
     # The funnel is printed in full so the detector can be audited from the log alone:
     # each stage should shed candidates, and a stage that sheds almost none means its
     # threshold is doing no work.
+    snapped = cand & df["_snap"].notna()
     print(
         f"[panel] corporate-action funnel: "
         f"{int(jumped.sum()):,} jumps > {cfg.jump:.0%} "
         f"→ {int((jumped & contiguous).sum()):,} contiguous "
         f"→ {int(cand.sum()):,} priced ≥ {cfg.min_price:.0f} & seasoned "
-        f"→ {int((cand & df['_snap'].notna()).sum()):,} snapped "
-        f"→ {len(ledger):,} turnover-invariant "
+        f"→ {int(snapped.sum()):,} snapped "
+        f"→ {len(ledger):,} accepted "
         f"({int(ledger['review'].sum()) if len(ledger) else 0} flagged for review)"
     )
+    if len(ledger):
+        by_w = ledger["witness"].value_counts().to_dict()
+        rescued = int((snapped & witnessed & ~to_ok).sum())
+        print(
+            f"[panel]   accepted by: {by_w} | "
+            f"{rescued} rescued by the ISIN witness that the turnover test alone rejected"
+        )
     return ledger
 
 
@@ -558,6 +637,35 @@ def assert_returns_preserved(
 
 
 # ── Lifecycle ───────────────────────────────────────────────────────────────────
+
+def resolve_tickers(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Guarantee a one-to-one ISIN↔ticker map.
+
+    ``build`` sets ``ticker`` to each entity's last observed symbol, which is
+    almost always unique — but NSE does re-issue a symbol after a delisting, and two
+    different companies sharing one column name downstream would silently merge two
+    price series. Collisions are broken deterministically by ISIN so the outcome does
+    not depend on row order, and reported rather than fixed quietly.
+    """
+    out = panel.copy()
+    key = "entity" if "entity" in out.columns else "isin"
+    pairs = out[[key, "ticker"]].drop_duplicates()
+    dup_names = pairs["ticker"].value_counts()
+    dup_names = dup_names[dup_names > 1]
+    if len(dup_names) == 0:
+        return out
+
+    print(f"[panel] WARN: {len(dup_names)} symbol(s) reused across ISINs — disambiguating")
+    rename: dict[str, str] = {}
+    for name in dup_names.index:
+        isins = sorted(pairs.loc[pairs["ticker"] == name, key])
+        for i, isin in enumerate(isins[1:], start=2):  # first keeps the bare symbol
+            rename[isin] = f"{name}.{i}"
+            print(f"[panel]   {name} ← {isin} → {name}.{i}")
+    out["ticker"] = out[key].map(rename).fillna(out["ticker"])
+    return out
+
 
 def classify_lifecycle(
     panel: pd.DataFrame, gap_days: int = 20, delist_return: float = -0.30
@@ -732,6 +840,11 @@ def build(
     # Canonical display ticker = the last symbol this entity ever traded under, so a
     # rename *or* an ISIN reissue reads as one continuous series downstream.
     adj["ticker"] = adj["entity"].map(adj.groupby("entity")["symbol"].last())
+    # Disambiguate BEFORE lifecycle so the panel, lifecycle table, universe mask and
+    # engine OHLCV all share ONE ticker namespace. Doing this downstream (in universe.py)
+    # left lifecycle.csv keyed on the raw symbol, so 170 disambiguated engine tickers had
+    # no terminal return and their delisting exits were silently dropped.
+    adj = resolve_tickers(adj)
 
     life = classify_lifecycle(adj)
 
@@ -773,6 +886,10 @@ def _dry_run() -> None:
         ("INE000A01024", "CRASHCO", "crash"),
         ("INE000A01032", "QUIETCO", "quiet"),
         ("INE111B01016", "REISSUE", "reissue"),   # ISIN changes at the ex-date
+        # ELECON-class: a real 1:2 split whose ex-date volume spikes far past the old
+        # turnover ceiling. Only the ISIN witness can rescue it, so it is the test that
+        # proves tier A does real work rather than merely widening a threshold.
+        ("INE222C01016", "SPIKECO", "spike"),
     )
     for isin, sym, kind in plan:
         px = 1000.0 * np.exp(np.cumsum(rng.normal(0, 0.012, len(dates))))
@@ -780,6 +897,10 @@ def _dry_run() -> None:
         if kind in ("split", "reissue"):          # 1:10 split at bar 60
             px[60:] /= 10.0
             qty[60:] *= 10.0                      # turnover invariant, as in reality
+        if kind == "spike":                       # 1:2 split, ex-date turnover ~30x
+            px[60:] /= 2.0
+            qty[60:] *= 2.0
+            qty[60] *= 30.0
         if kind == "crash":                       # genuine −90% with turnover collapse
             px[60:] *= 0.10
             qty[60:] *= 0.05
@@ -792,6 +913,9 @@ def _dry_run() -> None:
         if kind == "reissue":
             # Same issuer stem, new security serial, handing over on consecutive bars.
             frame.loc[60:, "isin"] = "INE111B01024"
+        if kind == "spike":
+            # Reissue lands one bar AFTER the ex-date, as it does on real data.
+            frame.loc[61:, "isin"] = "INE222C01024"
         rows.append(frame)
 
     panel = link_isins(pd.concat(rows, ignore_index=True))
@@ -808,6 +932,12 @@ def _dry_run() -> None:
     assert ("SPLITCO", ex) in found, f"missed the planted split; ledger={found}"
     assert ("REISSUE", ex) in found, \
         f"missed the split hidden behind an ISIN reissue; ledger={found}"
+    assert ("SPIKECO", ex) in found, \
+        f"missed the ELECON-class split with a huge ex-date volume spike; ledger={found}"
+
+    # The guard that keeps the turnover_hi rise from being a blanket loosening: a genuine
+    # wipeout has NO ISIN witness and collapsing turnover, so both tiers must still
+    # reject it. If this ever passes, the detector has stopped discriminating.
     assert not any(s == "CRASHCO" for s, _ in found), \
         f"false positive: flagged a genuine crash as a corporate action; ledger={found}"
     assert not any(s == "QUIETCO" for s, _ in found), "false positive on a quiet series"
@@ -815,12 +945,17 @@ def _dry_run() -> None:
     for sym in ("SPLITCO", "REISSUE"):
         fac = float(ledger.loc[ledger["symbol"] == sym, "factor"].iloc[0])
         assert abs(fac - 0.1) < 1e-6, f"{sym}: wrong factor {fac}, expected 0.1"
+    fac = float(ledger.loc[ledger["symbol"] == "SPIKECO", "factor"].iloc[0])
+    assert abs(fac - 0.5) < 1e-6, f"SPIKECO: wrong factor {fac}, expected 0.5"
+    # It must be the witness, not the widened ceiling, that saved SPIKECO.
+    w = ledger.loc[ledger["symbol"] == "SPIKECO", "witness"].iloc[0]
+    assert w == "isin_reissue", f"SPIKECO passed via {w!r}, expected the ISIN witness"
 
     adj = apply_adjustments(panel, ledger)
     assert_returns_preserved(panel, adj, ledger)
 
     # Post-adjustment the split must be gone: the ex-date return is now ordinary.
-    for sym in ("SPLITCO", "REISSUE"):
+    for sym in ("SPLITCO", "REISSUE", "SPIKECO"):
         s = adj[adj["symbol"] == sym].sort_values("date")["close"]
         ex_ret = float(s.pct_change().iloc[60])
         assert abs(ex_ret) < 0.10, f"{sym}: split survived adjustment ({ex_ret:.3f})"
