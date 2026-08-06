@@ -47,6 +47,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import config  # noqa: E402
+# The trailing-vol computation moved to liquidity.py so the capacity study and the
+# Phase 4c per-name cost model share one definition (A2). Same grouping key, same
+# full-window rule — the published curve is unchanged by the extraction.
+from src.phase4_data.liquidity import add_sigma  # noqa: E402
 
 DEFAULT_PANEL: Final[str] = "data/bhavcopy/panel_daily.parquet"
 DEFAULT_MASK: Final[str] = "data/nse500_universe_mask.parquet"
@@ -76,12 +80,7 @@ def load_inputs(
         if not os.path.exists(p):
             raise FileNotFoundError(f"{p} not found — run the Phase 4 build first.")
 
-    panel = pd.read_parquet(panel_path).sort_values(["entity", "date"])
-    panel["ret"] = panel.groupby("entity", sort=False)["close"].pct_change()
-    panel["sigma"] = (
-        panel.groupby("entity", sort=False)["ret"]
-        .transform(lambda s: s.rolling(VOL_WINDOW, min_periods=VOL_WINDOW).std())
-    )
+    panel = add_sigma(pd.read_parquet(panel_path), window=VOL_WINDOW)
 
     mask = pd.read_parquet(mask_path)
     flags = mask.stack()

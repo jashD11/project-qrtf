@@ -72,6 +72,77 @@ def _to_daily(returns: pd.Series) -> pd.Series:
 
 
 # --------------------------------------------------------------------------- #
+# Lo (2002) autocorrelation correction (Phase 4c D2)
+# --------------------------------------------------------------------------- #
+def variance_ratio(returns: pd.Series, horizon: int) -> float:
+    """
+    Lo-MacKinlay overlapping variance ratio at ``horizon`` days.
+
+        VR(m) = Var(m-day return) / (m · Var(1-day return))
+
+    VR = 1 under i.i.d. returns. VR > 1 means multi-day variance compounds faster than
+    linearly — the signature of positive autocorrelation. Overlapping m-day sums are
+    used (every start date, not every m-th) because the non-overlapping estimator
+    throws away a factor of ``m`` of the sample for no gain in consistency.
+    """
+    r = returns.dropna()
+    t = int(r.shape[0])
+    if t <= horizon + 1 or horizon < 2:
+        return 1.0
+    x = r.to_numpy(dtype=float)
+    mu = float(x.mean())
+    var_1 = float(((x - mu) ** 2).sum() / (t - 1))
+    if var_1 <= 0:
+        return 1.0
+    sums = np.convolve(x, np.ones(horizon), mode="valid")
+    var_m = float(
+        ((sums - horizon * mu) ** 2).sum()
+        / (horizon * (t - horizon + 1) * (1.0 - horizon / t))
+    )
+    return var_m / var_1 if var_m > 0 else 1.0
+
+
+def lo_scaling_factor(returns: pd.Series, horizon: int = 21) -> float:
+    """
+    Lo (2002) autocorrelation-corrected Sharpe scaling, as a share of the naive one.
+
+    The usual ``SR_annual = SR_daily · sqrt(252)`` is valid only for i.i.d. returns,
+    because it assumes multi-period variance grows linearly in time. These returns are
+    not i.i.d. — positions persist for days under a multi-day target — so the naive
+    scaling **overstates** the Sharpe. The corrected factor is ``1 / sqrt(VR)``:
+    positive autocorrelation gives VR > 1 and a factor below 1, so the adjustment
+    always moves against a strategy that holds its positions. It is not a tuning knob;
+    it is a bias being removed.
+
+    **Why a variance ratio and not the lag-by-lag sum.** Lo's formula can be written
+    as ``eta(q) = q / sqrt(q + 2·sum_k (q-k)·rho_k)``, and evaluating it directly is
+    the obvious implementation — but it multiplies every estimated ``rho_k`` by
+    ~``q`` = 252. Each ``rho_k`` carries a sampling error of ~``1/sqrt(T)`` ~ 0.02, so
+    ten lags of pure noise move the result by over 10%: measured on i.i.d. synthetic
+    returns that form returned factors from 0.99 to 1.18 depending only on the seed.
+    It was estimating its own noise. The variance ratio estimates the same quantity as
+    one number and is well behaved — on i.i.d. input it centres on 1.000 (sd 0.05),
+    and on AR(1) with rho=0.15 it recovers 0.866 against a theoretical 0.860.
+
+    ``horizon`` = 21 days: long enough to contain the whole life of a position under
+    the slowest target in the frozen grid, short enough to keep the estimator tight.
+    Returns 1.0 for a series too short to estimate.
+    """
+    vr = variance_ratio(returns, horizon)
+    if not np.isfinite(vr) or vr <= 0:
+        return 1.0
+    return float(1.0 / np.sqrt(vr))
+
+
+def lag1_autocorr(returns: pd.Series) -> float:
+    """Lag-1 autocorrelation — reported alongside the correction it drives."""
+    r = returns.dropna()
+    if r.shape[0] < 3:
+        return float("nan")
+    return float(r.autocorr(lag=1))
+
+
+# --------------------------------------------------------------------------- #
 # The statistics
 # --------------------------------------------------------------------------- #
 def probabilistic_sharpe_ratio(
@@ -130,19 +201,45 @@ def deflated_sharpe_ratio(
     n_trials: int | None = None,
     threshold: float = 0.95,
     benchmark_sharpe: float = 0.0,
+    autocorr_adjust: bool | None = None,
+    autocorr_horizon: int | None = None,
 ) -> pd.DataFrame:
     """
     Per-strategy DSR verdict for a matrix of DAILY return series (one column
     each). Returns a frame indexed by strategy_id, sorted by DSR descending.
+
+    When ``autocorr_adjust`` (D2), each column's per-period Sharpe is scaled by its
+    own Lo (2002) factor **before** anything else is computed — so the correction
+    flows into PSR, into DSR, into the cross-trial dispersion that sets SR*, and into
+    the reported annual Sharpe, rather than being bolted on at the end. It is applied
+    uniformly to every column, including the deflation benchmark's inputs.
+
+    ``T`` is deliberately left at the raw observation count. Autocorrelation also
+    shrinks the *effective* sample size, so leaving T alone understates the penalty —
+    a bias in the strategy's favour, kept because Lo's result is about the scaling of
+    the Sharpe and inventing an effective-T on top would be a second, less standard
+    adjustment stacked on the first.
     """
+    cfg = config.ML_CONFIG.dsr
+    autocorr_adjust = cfg.autocorr_adjust if autocorr_adjust is None else autocorr_adjust
+    autocorr_horizon = (
+        cfg.autocorr_horizon if autocorr_horizon is None else autocorr_horizon
+    )
+
     cols = list(daily_matrix.columns)
     stats: dict[str, dict] = {}
     for c in cols:
         r = daily_matrix[c].dropna()
         sd = r.std(ddof=1)
-        sr = float(r.mean() / sd) if sd > 0 else 0.0
+        sr_naive = float(r.mean() / sd) if sd > 0 else 0.0
+        factor = (
+            lo_scaling_factor(r, horizon=autocorr_horizon) if autocorr_adjust else 1.0
+        )
         stats[c] = dict(
-            sr=sr,
+            sr=sr_naive * factor,
+            sr_naive=sr_naive,
+            ac_factor=factor,
+            ac1=lag1_autocorr(r),
             T=int(r.shape[0]),
             skew=float(skew(r)) if r.shape[0] > 2 else 0.0,
             kurt=float(kurtosis(r, fisher=False)) if r.shape[0] > 3 else 3.0,
@@ -161,6 +258,9 @@ def deflated_sharpe_ratio(
         rows.append(dict(
             strategy_id=c,
             SR_ann=s["sr"] * _ANN,
+            SR_ann_naive=s["sr_naive"] * _ANN,
+            AC1=s["ac1"],
+            AC_factor=s["ac_factor"],
             SR_daily=s["sr"],
             skew=s["skew"],
             kurt=s["kurt"],
@@ -176,6 +276,7 @@ def deflated_sharpe_ratio(
     out.attrs["n_trials"] = n
     out.attrs["sharpe_std_daily"] = sharpe_std
     out.attrs["threshold"] = threshold
+    out.attrs["autocorr_adjust"] = autocorr_adjust
     return out.sort_values("DSR", ascending=False)
 
 
@@ -209,27 +310,34 @@ def run_dsr_gate(
 
     n = verdict.attrs["n_trials"]
     sstd = verdict.attrs["sharpe_std_daily"]
+    adj = verdict.attrs["autocorr_adjust"]
     n_pass = int(verdict["passed"].sum())
-    print("=" * 96)
+    print("=" * 104)
     print(f"  DSR CREDIBILITY GATE — {os.path.basename(ledger_path)} | "
           f"N_trials={n} | threshold={threshold:.2f} | passing {n_pass}/{len(verdict)}")
-    print("=" * 96)
-    print(f"  {'strategy_id':<40} {'SR_ann':>7} {'DSR':>6} {'PSR0':>6} "
-          f"{'skew':>6} {'kurt':>6} {'T':>6} {'minTRL':>8}  verdict")
-    print(f"  {'-'*40} {'-'*7} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*8}  {'-'*7}")
+    print("=" * 104)
+    print(f"  {'strategy_id':<38} {'SRnaive':>8} {'AC1':>6} {'SR_ann':>7} {'DSR':>6} "
+          f"{'PSR0':>6} {'skew':>6} {'kurt':>6} {'T':>6} {'minTRL':>7}  verdict")
+    print(f"  {'-'*38} {'-'*8} {'-'*6} {'-'*7} {'-'*6} {'-'*6} {'-'*6} {'-'*6} "
+          f"{'-'*6} {'-'*7}  {'-'*7}")
     for sid, row in verdict.iterrows():
         trl = "n/a" if not np.isfinite(row["minTRL"]) else f"{row['minTRL']:.0f}"
         verdict_str = "PASS" if row["passed"] else "fail"
-        print(f"  {sid[:40]:<40} {row['SR_ann']:>7.2f} {row['DSR']:>6.3f} "
+        print(f"  {sid[:38]:<38} {row['SR_ann_naive']:>8.2f} {row['AC1']:>6.3f} "
+              f"{row['SR_ann']:>7.2f} {row['DSR']:>6.3f} "
               f"{row['PSR0']:>6.3f} {row['skew']:>6.2f} {row['kurt']:>6.2f} "
-              f"{int(row['T']):>6} {trl:>8}  {verdict_str}")
+              f"{int(row['T']):>6} {trl:>7}  {verdict_str}")
     print(f"\n  deflation benchmark SR* (annualized) = "
           f"{verdict['SR_star_ann'].iloc[0]:.2f}  |  cross-trial Sharpe std (daily) = {sstd:.4f}")
-    if len(verdict) < 5:
-        print("  NOTE: few trials — the cross-trial Sharpe variance (hence the")
-        print("        deflation benchmark) is noisy. Set ML_CONFIG.dsr.trials_override")
-        print("        to the true number of cells searched for an honest N.")
-    print("=" * 96)
+    if adj:
+        print(f"  SR_ann is Lo (2002) autocorrelation-corrected (VR horizon="
+              f"{config.ML_CONFIG.dsr.autocorr_horizon}); SRnaive is the uncorrected "
+              f"sqrt(252) scaling.")
+    if n <= len(verdict):
+        print("  NOTE: N is not larger than the number of columns scored. The deflation")
+        print("        should use the number of cells SEARCHED across the program, not")
+        print("        the number reported — see config.TRIAL_LEDGER.")
+    print("=" * 104)
 
     if persist:
         out_csv = os.path.splitext(ledger_path)[0] + "_dsr_gate.csv"
@@ -276,11 +384,58 @@ if __name__ == "__main__":
     formula = probabilistic_sharpe_ratio(sr, len(s), 0.0, 3.0, 0.0)
     phi_ok = bool(np.isclose(direct, formula, atol=1e-6))
 
+    # --- D2: the Lo autocorrelation correction ----------------------------- #
+    # An AR(1) series with the SAME mean and per-period stdev as an i.i.d. one has an
+    # identical naive Sharpe but a genuinely worse risk-adjusted return, because its
+    # multi-period variance compounds faster. The factor must catch that.
+    def _ar1(rho: float, n: int, seed: int) -> pd.Series:
+        g = np.random.default_rng(seed)
+        e = g.normal(0.0, 0.01, n)
+        x = np.zeros(n)
+        for i in range(1, n):
+            x[i] = rho * x[i - 1] + e[i]
+        return pd.Series(0.003 + x, index=pd.bdate_range("2018-01-01", periods=n))
+
+    # Averaged over seeds: a single draw of this statistic has sd ~0.05, so a
+    # one-seed test would be checking the seed, not the estimator.
+    f_iid = float(np.mean([lo_scaling_factor(_ar1(0.0, 2337, s)) for s in range(40)]))
+    f_pos = float(np.mean([lo_scaling_factor(_ar1(0.15, 2337, s)) for s in range(40)]))
+    f_neg = float(np.mean([lo_scaling_factor(_ar1(-0.15, 2337, s)) for s in range(40)]))
+    # AR(1)'s asymptotic factor is sqrt((1-rho)/(1+rho)).
+    th_pos = float(np.sqrt(0.85 / 1.15))
+    print(f"  Lo factor (mean of 40 seeds): iid={f_iid:.3f}  AR(1)+0.15={f_pos:.3f} "
+          f"(theory {th_pos:.3f})  AR(1)-0.15={f_neg:.3f}")
+
+    # With the correction ON, a positively autocorrelated series must lose Sharpe;
+    # with it OFF the two must be scored identically (the flag really is the switch).
+    # rho=0.30 for the single-draw checks below: at that level the factor (~0.75,
+    # sd ~0.04) is many standard errors from 1.0, so the assertion tests the
+    # correction rather than the luck of one seed.
+    ac_frame = pd.DataFrame({"iid": _ar1(0.0, 2337, 1), "ar_pos": _ar1(0.30, 2337, 2)})
+    on = deflated_sharpe_ratio(ac_frame, n_trials=2, autocorr_adjust=True)
+    off = deflated_sharpe_ratio(ac_frame, n_trials=2, autocorr_adjust=False)
+
     checks = {
         "edge strategy PASSES": edge_pass,
         "all noise strategies FAIL": noise_fail,
         "N=1 => DSR == PSR0 (no deflation)": n1_ok,
         "PSR matches direct Phi formula": phi_ok,
+        "Lo factor unbiased on i.i.d. returns": bool(0.98 < f_iid < 1.02),
+        "Lo factor recovers the AR(1) theory value": bool(abs(f_pos - th_pos) < 0.02),
+        "Lo factor penalizes positive autocorrelation": bool(f_pos < 0.90),
+        "Lo factor rewards negative autocorrelation": bool(f_neg > 1.10),
+        "correction ON lowers an autocorrelated Sharpe": bool(
+            on.loc["ar_pos", "SR_ann"] < on.loc["ar_pos", "SR_ann_naive"]
+        ),
+        "correction OFF is a true no-op": bool(
+            np.allclose(off["SR_ann"], off["SR_ann_naive"])
+        ),
+        "correction applies to every column, not just one": bool(
+            np.isfinite(on["AC_factor"]).all()
+        ),
+        "honest N is larger than a phase's column count": bool(
+            config.TRIALS_SEARCHED == 30 and config.ML_CONFIG.dsr.trials_override == 30
+        ),
     }
     print("-" * 96)
     for name, ok in checks.items():

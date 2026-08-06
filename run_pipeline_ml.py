@@ -55,14 +55,29 @@ from src.production_ml.tier2_regime import (
     RegimeResult,
     build_features as build_regime_features,
 )
-from src.production_ml.tier3_execution import execute_ml_strategy
+from src.production_ml.tier3_execution import (
+    execute_ml_strategy,
+    load_cost_panels,
+    restricts_shorts,
+    run_execution,
+)
 from src.production_ml.tier4_dsr_gate import run_dsr_gate, _to_daily
+from src.production_ml.wf_cache import cached_walk_forward
 from src.sandbox_run.tier4_dsr import log_to_dsr_ledger
 
 DIVIDER: Final[str] = "=" * 72
-PRODUCTION_LEDGER: Final[str] = "data/trial_database/production_dsr_matrix.parquet"
+DEFAULT_PRODUCTION_LEDGER: Final[str] = "data/trial_database/production_dsr_matrix.parquet"
+# Rebound by --ledger (E4). Phase 4b had to move the Phase 3 ledger aside by hand
+# because this path was hard-coded; a run should be able to name its own ledger.
+PRODUCTION_LEDGER: str = DEFAULT_PRODUCTION_LEDGER
+# Gross returns land in a sibling ledger rather than extra columns in the headline
+# one: the DSR gate scores every column it finds, and a gross series is not a
+# candidate strategy — folding it in would corrupt the cross-trial Sharpe dispersion
+# that sets the deflation benchmark.
+GROSS_LEDGER: str = DEFAULT_PRODUCTION_LEDGER.replace(".parquet", "_gross.parquet")
 SENSITIVITY_LEDGER: Final[str] = "data/trial_database/production_sensitivity_dsr_matrix.parquet"
 DIAGNOSTICS_PATH_TMPL: Final[str] = "data/trial_database/tree_fit_diagnostics_{frequency}.csv"
+EXEC_DIAGNOSTICS_PATH: str = "data/trial_database/execution_diagnostics.csv"
 
 # Frequencies served by the Phase 4 point-in-time panel (src/phase4_data/). These carry
 # a universe mask, delisting exits, and their own regime panel; the Phase 2/3 entries do
@@ -89,6 +104,7 @@ def make_ml_config(
     decile_pct: float = DECILE_PCT,
     hmm_states: int = config.HEADLINE_HMM_STATES,
     rebalance_buffer_mult: float = 2.0,
+    target_col: str = DEFAULT_TARGET,
 ) -> StrategyConfig:
     """A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels."""
     return StrategyConfig(
@@ -100,6 +116,7 @@ def make_ml_config(
         frequency=frequency,
         decile_pct=decile_pct,
         rebalance_buffer_mult=rebalance_buffer_mult,
+        target_col=target_col,
     )
 
 
@@ -187,7 +204,10 @@ def compute_signals(
     engine = TreeAlphaEngine.from_frequency(
         frequency, target_col=target_col, decile_pct=decile_pct
     )
-    wf = engine.run_walk_forward(features)
+    # E1: served from disk when this exact fit has been computed before. The fit is a
+    # pure function of (features, engine knobs), so the cache is transparent — see
+    # src/production_ml/wf_cache.py. QRTF_WF_CACHE=0 forces a cold fit.
+    wf = cached_walk_forward(engine, features, frequency)
     return wf, price_wide
 
 
@@ -213,7 +233,67 @@ def compute_regime(hmm_states: int, frequencies: list[str] | None = None) -> Reg
     return RegimeDetector(n_states=hmm_states).fit_predict(build_regime_features(cfg))
 
 
-def _persist_ic(wf: WalkForwardResult, frequency: str) -> None:
+def _print_cost_regime() -> None:
+    """
+    State the cost model this run charges, up front, in the log.
+
+    Phase 4b's headline was decided by a cost input nobody had written down
+    (``slippage_bps = 0.0``, impact never called). Printing the regime before the
+    grid runs makes the assumption impossible to lose track of afterwards.
+    """
+    c = config.ML_CONFIG.cost
+    print(f"\n{DIVIDER}\n  COST REGIME\n{DIVIDER}")
+    print(f"  statutory one-way          : {c.compose_oneway_bps():.4f} bps")
+    print(f"  apply_costs                : {c.apply_costs}")
+    print(f"  per-name spread + impact   : {c.charge_per_name}"
+          f"{f' (estimator={c.spread_estimator}, AUM=Rs {c.aum_rupees:,.0f})' if c.charge_per_name else ''}")
+    print(f"  participation cap          : {c.enforce_participation_cap}"
+          f"{f' (<= {c.max_participation:.0%} of ADV)' if c.enforce_participation_cap else ''}")
+    print(f"  short borrow               : "
+          f"{'tiered ' + str(c.borrow_bps_by_quartile) if c.tiered_borrow else f'flat {c.short_borrow_bps_annual:.0f} bps/yr'}")
+
+
+def _load_panels_if_needed(styles: list[str]):
+    """Read the Phase 4c cost panels once per run, if any of them will be consumed."""
+    c = config.ML_CONFIG.cost
+    need_shortable = any(restricts_shorts(s) for s in styles)
+    if not c.apply_costs or not (
+        c.charge_per_name or c.enforce_participation_cap or c.tiered_borrow
+        or need_shortable
+    ):
+        return None
+    return load_cost_panels(need_shortable=need_shortable)
+
+
+def _record_diagnostics(cfg: StrategyConfig, result) -> None:
+    """
+    Append one row of per-cell execution diagnostics to a CSV (read-only output).
+
+    These are the §6 numbers — effective cost per side, participation, turnover, the
+    gross/net split, short-book width. Measured during the run that produced the
+    result, so none of them has to be inferred from it later.
+    """
+    row = dict(
+        strategy_id=cfg.strategy_id, frequency=cfg.frequency,
+        execution_style=cfg.execution_style, target=cfg.target_col,
+        cum_net=float((1 + result.net).prod() - 1),
+        cum_gross=float((1 + result.gross.dropna()).prod() - 1),
+        sharpe_net=_cum_sharpe(result.net)[1],
+        sharpe_gross=_cum_sharpe(result.gross.dropna())[1],
+        **result.diagnostics,
+    )
+    os.makedirs(os.path.dirname(EXEC_DIAGNOSTICS_PATH) or ".", exist_ok=True)
+    # Read-modify-write rather than append. Cells do not all emit the same keys — only
+    # the SLB styles report a short-book width — so appending would write rows wider
+    # than the header the first cell established, producing a CSV that cannot be
+    # parsed. Rewriting on the union keeps the file valid whatever mix of styles ran.
+    frame = pd.DataFrame([row])
+    if os.path.exists(EXEC_DIAGNOSTICS_PATH):
+        frame = pd.concat([pd.read_csv(EXEC_DIAGNOSTICS_PATH), frame], ignore_index=True)
+    frame.to_csv(EXEC_DIAGNOSTICS_PATH, index=False)
+
+
+def _persist_ic(wf: WalkForwardResult, frequency: str, target_col: str = "") -> None:
     """
     Write the read-only Tier-1 rank-IC fit diagnostic for one frequency.
 
@@ -223,7 +303,8 @@ def _persist_ic(wf: WalkForwardResult, frequency: str) -> None:
     """
     if wf.ic_diagnostics is None:
         return
-    path = DIAGNOSTICS_PATH_TMPL.format(frequency=frequency)
+    tag = f"{frequency}_{target_col.rsplit('_', 1)[-1]}" if target_col else frequency
+    path = DIAGNOSTICS_PATH_TMPL.format(frequency=tag)
     with open(path, "w") as fh:
         fh.write("# READ-ONLY fit diagnostic (cross-sectional rank IC). Do NOT use to\n")
         fh.write("# select cells or tune hyperparameters on OOS data — that is the\n")
@@ -235,57 +316,77 @@ def _persist_ic(wf: WalkForwardResult, frequency: str) -> None:
 # --------------------------------------------------------------------------- #
 # Headline grid (phase3 R1)
 # --------------------------------------------------------------------------- #
-def build_headline_grid(frequencies: list[str], styles: list[str]) -> list[StrategyConfig]:
+def build_headline_grid(
+    frequencies: list[str], styles: list[str], targets: list[str],
+) -> list[StrategyConfig]:
     """The explicit Cartesian product of the committed [SWEEP] axes."""
     return [
-        make_ml_config(freq, style)
-        for freq, style in itertools.product(frequencies, styles)
+        make_ml_config(freq, style, target_col=target)
+        for freq, style, target in itertools.product(frequencies, styles, targets)
     ]
 
 
 def run_headline_grid(
     frequencies: list[str], styles: list[str], skip_dsr: bool = False,
-    target_col: str = DEFAULT_TARGET,
+    targets: list[str] | None = None,
 ) -> None:
-    configs = build_headline_grid(frequencies, styles)
+    targets = targets or [DEFAULT_TARGET]
+    configs = build_headline_grid(frequencies, styles, targets)
 
     print(DIVIDER)
     print(f"  PRODUCTION_ML HEADLINE SWEEP — {len(configs)} cells "
-          f"({len(frequencies)} freq x {len(styles)} styles, hmm_states="
-          f"{config.HEADLINE_HMM_STATES} frozen)")
+          f"({len(frequencies)} freq x {len(styles)} styles x {len(targets)} targets, "
+          f"hmm_states={config.HEADLINE_HMM_STATES} frozen)")
     print(DIVIDER)
     for cfg in configs:
-        print(f"  {cfg.strategy_id}  ->  freq={cfg.frequency}  style={cfg.execution_style}")
+        print(f"  {cfg.strategy_id}  ->  freq={cfg.frequency}  style={cfg.execution_style}"
+              f"  target={cfg.target_col}")
+    _print_cost_regime()
 
     # Tier 2 once for the whole run (regime is daily, frequency-independent).
     print(f"\n[Tier 2] Market-regime HMM (n_states={config.HEADLINE_HMM_STATES}) — once")
     regime = compute_regime(config.HEADLINE_HMM_STATES, frequencies)
     panic = regime.panic
 
-    # Tier 1 once per frequency; fan out Tier 3 + Tier 4 across styles.
-    for frequency in frequencies:
-        print(f"\n{DIVIDER}\n  FREQUENCY: {frequency}\n{DIVIDER}")
+    # Cost panels read once per run rather than once per cell — they are the same
+    # (date x ticker) Parquets for every style and every target.
+    panels = _load_panels_if_needed(styles)
+
+    # Tier 1 once per (frequency, target); fan out Tier 3 + Tier 4 across styles.
+    # The target is a fit-time axis, so it joins frequency in the outer loop — only
+    # the execution style is free to fan out over a shared fit.
+    for frequency, target_col in itertools.product(frequencies, targets):
+        print(f"\n{DIVIDER}\n  FREQUENCY: {frequency} | TARGET: {target_col}\n{DIVIDER}")
         print(f"[Tier 1] Tree walk-forward (decile_pct={DECILE_PCT}, "
               f"target={target_col}) — once for {frequency}")
         wf, price_wide = compute_signals(frequency, DECILE_PCT, target_col=target_col)
-        _persist_ic(wf, frequency)
+        _persist_ic(wf, frequency, target_col)
         terminal = load_terminal_returns(frequency)
 
         for style in styles:
-            cfg = make_ml_config(frequency, style)
-            print(f"\n[Tier 3] {frequency} | {style}")
-            returns = execute_ml_strategy(
-                wf, panic, price_wide, cfg, terminal_returns=terminal
+            cfg = make_ml_config(frequency, style, target_col=target_col)
+            print(f"\n[Tier 3] {frequency} | {style} | {target_col}")
+            result = run_execution(
+                wf, panic, price_wide, cfg, terminal_returns=terminal, panels=panels,
             )
             # Compound intraday bars to daily BEFORE logging so every frequency
             # shares the ledger's daily index. Without this, intraday bar
             # timestamps miss the daily index labels and the column lands all-NaN
             # (T=0). Idempotent for already-daily series (one bar/day passes
             # through); the DSR gate re-applies _to_daily harmlessly on read.
-            daily_returns = _to_daily(returns)
-            log_to_dsr_ledger(cfg.strategy_id, daily_returns, ledger_path=PRODUCTION_LEDGER)
+            log_to_dsr_ledger(
+                cfg.strategy_id, _to_daily(result.net), ledger_path=PRODUCTION_LEDGER
+            )
+            # E2 — gross banked in the same run. Phase 4b wrote net only, so its
+            # gross Sharpe could only be reconstructed by adding an average drag
+            # back, and recovering it exactly meant a second 80-minute fit.
+            log_to_dsr_ledger(
+                f"{cfg.strategy_id}__gross", _to_daily(result.gross),
+                ledger_path=GROSS_LEDGER,
+            )
+            _record_diagnostics(cfg, result)
 
-    _summarize(configs, PRODUCTION_LEDGER, frequencies, styles)
+    _summarize(configs, PRODUCTION_LEDGER, frequencies, styles, targets)
 
     # Tier 4 — the credibility gate: deflate each Sharpe for the full grid's
     # multiple-testing count (N = every cell searched, not just what's written).
@@ -296,7 +397,21 @@ def run_headline_grid(
               "full grid is banked for the authoritative N-trial verdict.")
         return
     print()
-    run_dsr_gate(PRODUCTION_LEDGER, n_trials=len(configs))
+    # N is the number of configurations the PROGRAM has searched, not the number this
+    # run happens to write (D1). ``len(configs)`` was the old default and it silently
+    # under-deflates every time: the Phase 4c grid writes 6 columns but stands on 24
+    # earlier trials, and scoring it at N=6 would hand back most of the multiple-testing
+    # correction the gate exists to apply. The explicit tally in config.TRIAL_LEDGER
+    # wins; len(configs) is only the fallback when no tally has been declared.
+    honest_n = config.ML_CONFIG.dsr.trials_override or len(configs)
+    if honest_n < len(configs):
+        raise ValueError(
+            f"declared N={honest_n} is smaller than the {len(configs)} cells this run "
+            "searched — the trial ledger in config.TRIAL_LEDGER is out of date."
+        )
+    print(f"[Tier 4] N = {honest_n} searched configurations "
+          f"({len(configs)} written by this run) — see config.TRIAL_LEDGER")
+    run_dsr_gate(PRODUCTION_LEDGER, n_trials=honest_n)
 
 
 # --------------------------------------------------------------------------- #
@@ -355,11 +470,20 @@ def run_sensitivity(axis: str, target_col: str = DEFAULT_TARGET) -> None:
         cfg = make_ml_config(
             frequency, params["execution_style"], decile_pct=decile_pct,
             rebalance_buffer_mult=params["rebalance_buffer_mult"],
+            target_col=target_col,
         )
         sid = f"SENS_{axis.upper()}_{value}_{cfg.strategy_id}"
         print(f"\n[Sensitivity] {axis}={value}")
-        returns = execute_ml_strategy(wf, panic, price_wide, cfg)
-        log_to_dsr_ledger(sid, returns, ledger_path=SENSITIVITY_LEDGER)
+        # E3, two latent bugs fixed. (1) terminal_returns was omitted, so on a Phase 4
+        # frequency every delisting exit silently vanished — the exact survivorship
+        # flattery the point-in-time panel exists to remove. (2) _to_daily was skipped,
+        # so any intraday frequency landed an all-NaN ledger column. Both were dormant
+        # only because SENSITIVITY_BASE["frequency"] happens to be daily.
+        returns = execute_ml_strategy(
+            wf, panic, price_wide, cfg,
+            terminal_returns=load_terminal_returns(frequency),
+        )
+        log_to_dsr_ledger(sid, _to_daily(returns), ledger_path=SENSITIVITY_LEDGER)
         rows.append((value, returns))
 
     print(f"\n{DIVIDER}\n  SENSITIVITY DISTRIBUTION — {axis} (report the band, not the peak)\n{DIVIDER}")
@@ -385,38 +509,45 @@ def _cum_sharpe(returns: pd.Series) -> tuple[float, float]:
 
 def _summarize(
     configs: list[StrategyConfig], ledger_path: str,
-    frequencies: list[str], styles: list[str],
+    frequencies: list[str], styles: list[str], targets: list[str] | None = None,
 ) -> None:
+    targets = targets or [DEFAULT_TARGET]
     ledger = pd.read_parquet(ledger_path)
     # Map each cell's metrics via the in-memory configs (NOT by parsing the id).
     metrics = {
-        (cfg.frequency, cfg.execution_style): _cum_sharpe(ledger[cfg.strategy_id])
+        (cfg.frequency, cfg.execution_style, cfg.target_col): _cum_sharpe(
+            ledger[cfg.strategy_id]
+        )
         for cfg in configs if cfg.strategy_id in ledger.columns
     }
 
     print(f"\n{DIVIDER}\n  HEADLINE SWEEP COMPLETE — {ledger.shape[1]} ledger column(s)\n{DIVIDER}")
-    print("\n  Per-cell (freq x style): CumRet / Sharpe")
-    print(f"  {'freq':<8}" + "".join(f"{s:>22}" for s in styles))
-    for freq in frequencies:
-        cells = []
-        for style in styles:
-            cum, sh = metrics.get((freq, style), (0.0, 0.0))
-            cells.append(f"{cum:>+11.2%}/{sh:>6.2f}")
-        print(f"  {freq:<8}" + "".join(f"{c:>22}" for c in cells))
+    print("\n  Per-cell: CumRet / Sharpe")
+    for target in targets:
+        print(f"\n  target={target}")
+        print(f"  {'freq':<14}" + "".join(f"{s:>22}" for s in styles))
+        for freq in frequencies:
+            cells = []
+            for style in styles:
+                cum, sh = metrics.get((freq, style, target), (0.0, 0.0))
+                cells.append(f"{cum:>+11.2%}/{sh:>6.2f}")
+            print(f"  {freq:<14}" + "".join(f"{c:>22}" for c in cells))
 
-    # Distribution across each swept axis (hold the other axis's members together).
-    print("\n  Distribution across frequency (mean Sharpe per style):")
-    for style in styles:
-        shs = [metrics[(f, style)][1] for f in frequencies if (f, style) in metrics]
-        if shs:
-            print(f"    {style:<14} mean={sum(shs)/len(shs):>6.2f}  "
-                  f"min={min(shs):>6.2f}  max={max(shs):>6.2f}")
-    print("\n  Distribution across execution_style (mean Sharpe per frequency):")
-    for freq in frequencies:
-        shs = [metrics[(freq, s)][1] for s in styles if (freq, s) in metrics]
-        if shs:
-            print(f"    {freq:<14} mean={sum(shs)/len(shs):>6.2f}  "
-                  f"min={min(shs):>6.2f}  max={max(shs):>6.2f}")
+    # Distribution across each swept axis (hold the other axes' members together).
+    def _band(label: str, keyfn) -> None:
+        print(f"\n  Distribution across {label}:")
+        groups: dict = {}
+        for key, (_, sh) in metrics.items():
+            groups.setdefault(keyfn(key), []).append(sh)
+        for name, shs in groups.items():
+            print(f"    {str(name):<22} mean={sum(shs)/len(shs):>6.2f}  "
+                  f"min={min(shs):>6.2f}  max={max(shs):>6.2f}  n={len(shs)}")
+
+    if len(frequencies) > 1:
+        _band("execution_style, held per frequency", lambda k: (k[0], k[1]))
+    _band("execution_style", lambda k: k[1])
+    if len(targets) > 1:
+        _band("target", lambda k: k[2])
 
     print("\n  NOTE: hmm_states is not swept — the panic gate is n_states-invariant,")
     print("        so a 2- vs 3-state grid would be return-identical today. Wiring")
@@ -425,6 +556,50 @@ def _summarize(
 
 
 # --------------------------------------------------------------------------- #
+# Phase 4c frozen grid (docs/phase4c_plan.md §5)
+# --------------------------------------------------------------------------- #
+def apply_phase4c_regime(args) -> tuple[list[str], list[str], list[str]]:
+    """
+    Switch the run into the Phase 4c frozen grid and its cost regime.
+
+    The grid and every cost override live in ``config`` (``PHASE4C_*``), not in this
+    function and not on a command line, so the configuration that produced a result
+    stays recoverable from the repo alone. Explicit ``--frequencies/--styles/--target``
+    flags are honoured — a diagnostic variant is allowed — but it must then be written
+    to the SENSITIVITY ledger and never promoted, which the printed warning says.
+    """
+    from dataclasses import replace
+
+    config.ML_CONFIG.cost = replace(
+        config.ML_CONFIG.cost, **config.PHASE4C_COST_OVERRIDES
+    )
+    defaults = (config.SWEEP_FREQUENCIES, config.SWEEP_EXECUTION_STYLES, [DEFAULT_TARGET])
+    frequencies = (
+        [config.PHASE4C_FREQUENCY] if args.frequencies == defaults[0] else args.frequencies
+    )
+    styles = config.PHASE4C_STYLES if args.styles == defaults[1] else args.styles
+    targets = config.PHASE4C_TARGETS if args.target == defaults[2] else args.target
+
+    if args.ledger == DEFAULT_PRODUCTION_LEDGER:
+        args.ledger = config.PHASE4C_LEDGER
+
+    frozen = (
+        frequencies == [config.PHASE4C_FREQUENCY]
+        and styles == config.PHASE4C_STYLES
+        and targets == config.PHASE4C_TARGETS
+    )
+    print(DIVIDER)
+    print("  PHASE 4c FROZEN GRID" if frozen else "  PHASE 4c COST REGIME — MODIFIED GRID")
+    print(DIVIDER)
+    if not frozen:
+        print("  WARNING: the grid was overridden on the command line. This is a")
+        print("  DIAGNOSTIC variant, not the frozen grid. It belongs on the")
+        print("  sensitivity ledger and must never be promoted — reporting whichever")
+        print("  of the two reads better is exactly the selection bias the DSR gate")
+        print("  exists to correct (docs/phase4c_plan.md §5).")
+    return frequencies, styles, targets
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PRODUCTION_ML sweep orchestrator")
     parser.add_argument(
@@ -441,14 +616,29 @@ def main() -> None:
         help="restrict the execution_style axis",
     )
     parser.add_argument(
-        "--dsr", nargs="?", const=PRODUCTION_LEDGER, default=None, metavar="LEDGER",
+        "--dsr", nargs="?", const="", default=None, metavar="LEDGER",
         help="score the DSR credibility gate on an EXISTING ledger (no recompute); "
              "optionally pass a ledger path (default: the production ledger)",
     )
     parser.add_argument(
-        "--target", default=DEFAULT_TARGET, metavar="COL",
-        help="tree learning target column (e.g. tgt_fwd_logret_1b or "
-             "tgt_fwd_logret_5b — a slower 5-day signal cuts turnover)",
+        "--ledger", default=DEFAULT_PRODUCTION_LEDGER, metavar="PATH",
+        help="ledger Parquet this run writes its columns to (E4). Naming a fresh "
+             "ledger is how a phase keeps its cells separate without moving files "
+             "aside by hand",
+    )
+    parser.add_argument(
+        "--target", nargs="+", default=[DEFAULT_TARGET], metavar="COL",
+        help="tree learning target column(s) — a swept axis, not a runtime option. "
+             "e.g. tgt_fwd_logret_1b / _5b (a slower signal cuts turnover) / _21b. "
+             "Passing more than one makes the target a structural fork of the grid, "
+             "which is paid for in N (config.TRIAL_LEDGER)",
+    )
+    parser.add_argument(
+        "--phase4c", action="store_true",
+        help="run the Phase 4c frozen grid (docs/phase4c_plan.md §5): the "
+             "daily_nse500 panel x {long_only, long_short_slb, dynamic_tilt_slb} x "
+             "{5b, 21b}, with per-name spread + impact, the participation cap, an "
+             "SLB-restricted short leg and tiered borrow all ON",
     )
     parser.add_argument(
         "--skip-dsr", action="store_true",
@@ -458,14 +648,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    global PRODUCTION_LEDGER, GROSS_LEDGER, EXEC_DIAGNOSTICS_PATH
+    frequencies, styles, targets = args.frequencies, args.styles, args.target
+
+    if args.phase4c:
+        frequencies, styles, targets = apply_phase4c_regime(args)
+
+    PRODUCTION_LEDGER = args.ledger
+    GROSS_LEDGER = args.ledger.replace(".parquet", "_gross.parquet")
+    EXEC_DIAGNOSTICS_PATH = args.ledger.replace(".parquet", "_execution_diagnostics.csv")
+
     if args.dsr is not None:
-        run_dsr_gate(args.dsr)
+        run_dsr_gate(args.dsr or args.ledger)
     elif args.sensitivity:
-        run_sensitivity(args.sensitivity, target_col=args.target)
+        run_sensitivity(args.sensitivity, target_col=targets[0])
     else:
         run_headline_grid(
-            args.frequencies, args.styles, skip_dsr=args.skip_dsr,
-            target_col=args.target,
+            frequencies, styles, skip_dsr=args.skip_dsr, targets=targets,
         )
 
 
