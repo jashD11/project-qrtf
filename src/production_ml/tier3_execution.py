@@ -240,6 +240,31 @@ def _align_panic(panic: pd.Series, bar_index: pd.Index, frequency: str) -> pd.Se
     return bcast > 0.5
 
 
+def forward_returns(price_wide: pd.DataFrame, bridge_halts: bool = False) -> pd.DataFrame:
+    """
+    Forward return on bar T = price[T+1]/price[T] - 1, on the FULL price history.
+
+    The cross-session/overnight move is intentionally KEPT (a real return on a held
+    position) — this differs from the tree label's cross-session null.
+
+    ``bridge_halts`` prices a position held into a **trading halt**. A suspended name
+    stops printing for a stretch and then resumes, so its next-bar price is NaN even
+    though nothing was exited — and because ``.sum()`` skips NaN, the halt would be
+    realized at exactly 0%. That is the same exit-side survivorship flattery
+    ``apply_terminal_returns`` closes for delistings: across this panel's 41 halt
+    cells the avoided move averages **-6.1%** (range -59% to +60%). You cannot sell a
+    suspended stock, so the position is carried to the next available quote and the
+    move is booked on the last bar that traded.
+
+    ``bfill`` stops at each name's last quote, so cells past a genuine delisting stay
+    NaN and are still filled by ``apply_terminal_returns`` — halts and exits do not
+    collide. Off by default: the Phase 2/3 panels carry internal holes of their own
+    (17 daily cells), so enabling this unconditionally would silently restate Phase 3.
+    """
+    nxt = price_wide.bfill().shift(-1) if bridge_halts else price_wide.shift(-1)
+    return nxt / price_wide - 1
+
+
 def apply_terminal_returns(
     fwd: pd.DataFrame,
     price_wide: pd.DataFrame,
@@ -345,15 +370,16 @@ def execute_ml_strategy(
     panic_bars: pd.Series = _align_panic(panic, long_mask.index, cfg.frequency)
     weights: pd.DataFrame = build_weight_matrix(long_mask, short_mask, panic_bars, cfg)
 
-    # Forward return on bar T = price[T+1]/price[T] - 1, computed on the FULL
-    # price history so "next bar" is real, then aligned to the scored bars.
-    # NB: the cross-session/overnight move is intentionally KEPT (a real return
-    # on a held position) — this differs from the tree label's cross-session null.
-    forward_returns: pd.DataFrame = price_wide.shift(-1) / price_wide - 1
+    # Forward returns on the full price history, then aligned to the scored bars.
+    # Halts are bridged only on the Phase 4 path (where terminal_returns is supplied),
+    # so the Phase 2/3 panels reproduce bit-for-bit — see forward_returns().
+    fwd_full: pd.DataFrame = forward_returns(
+        price_wide, bridge_halts=terminal_returns is not None
+    )
 
-    common: pd.Index = weights.index.intersection(forward_returns.index)
+    common: pd.Index = weights.index.intersection(fwd_full.index)
     weights = weights.loc[common]
-    fwd: pd.DataFrame = forward_returns.reindex(index=common, columns=weights.columns)
+    fwd: pd.DataFrame = fwd_full.reindex(index=common, columns=weights.columns)
 
     # Delisting exits. Without this a position held into a delisting is realized at
     # an implicit 0% (see apply_terminal_returns), quietly restoring the survivorship
