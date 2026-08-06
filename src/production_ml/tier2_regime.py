@@ -42,14 +42,35 @@ broadcast helper is included so intraday strategies can later inherit the daily
 regime with no look-ahead.
 """
 
+import logging
 import os
 import sys
+import warnings
 from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
+from sklearn.exceptions import ConvergenceWarning
+
+
+class _NotConvergingFilter(logging.Filter):
+    """
+    Drop hmmlearn's blanket "Model is not converging" record.
+
+    It fires on ANY negative log-likelihood delta, however small, so it cannot
+    distinguish a fit sitting on its convergence floor from one actually diverging.
+    ``RegimeDetector._fit_block`` makes that distinction on the magnitude of the delta
+    and raises when it is real; suppressing the record here is what stops the benign
+    case from training everyone to ignore the message.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "not converging" not in record.getMessage().lower()
+
+
+_NOT_CONVERGING_FILTER: Final[_NotConvergingFilter] = _NotConvergingFilter()
 
 # Make the repo root importable whether run directly or by an orchestrator.
 _ROOT: str = os.path.dirname(
@@ -279,6 +300,14 @@ class RegimeDetector:
         np.fill_diagonal(prior, 1.0 + self.cfg.transmat_stickiness)
         return prior
 
+    # EM log-likelihood can wobble by a hair at the convergence floor without the fit
+    # being in any trouble. hmmlearn prints "Model is not converging" for ANY negative
+    # delta, so the Phase 4b log carried that warning at delta = -0.002 on a
+    # log-likelihood of -1399 — a relative move of 1.4e-6, i.e. noise. Left as-is the
+    # message is pure alarm fatigue, and a genuinely diverging fit would read exactly
+    # the same. So the benign case is silenced and a real one is escalated.
+    _LL_TOLERANCE: Final[float] = 1e-4   # |delta| / |log-likelihood|
+
     def _fit_block(self, train_obs: np.ndarray) -> GaussianHMM:
         model = GaussianHMM(
             n_components=self.n_states,
@@ -287,7 +316,33 @@ class RegimeDetector:
             random_state=self.cfg.random_state,
             transmat_prior=self._transmat_prior(),
         )
-        model.fit(train_obs)
+        # hmmlearn reports non-convergence through the `logging` module, not through
+        # `warnings`, so a warnings filter does not touch it — the record has to be
+        # dropped at the logger. It must be the EMITTING logger ("hmmlearn.base"), not
+        # the "hmmlearn" parent: a filter on a logger applies to records logged through
+        # that logger, and records propagating up from a child skip the parent's filters
+        # entirely.
+        hmm_log = logging.getLogger("hmmlearn.base")
+        hmm_log.addFilter(_NOT_CONVERGING_FILTER)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=ConvergenceWarning)
+                model.fit(train_obs)
+        finally:
+            hmm_log.removeFilter(_NOT_CONVERGING_FILTER)
+
+        history = list(getattr(model.monitor_, "history", []))
+        if len(history) >= 2:
+            delta = history[-1] - history[-2]
+            scale = max(abs(history[-1]), 1.0)
+            if delta < 0 and abs(delta) / scale > self._LL_TOLERANCE:
+                raise RuntimeError(
+                    f"Tier 2 HMM diverged: log-likelihood fell by {abs(delta):.4f} "
+                    f"({abs(delta) / scale:.2e} relative) on the final EM step. This is "
+                    f"beyond the {self._LL_TOLERANCE:.0e} floor that ordinary numerical "
+                    "wobble produces, so the regime series this run would emit is not "
+                    "trustworthy."
+                )
         return model
 
     def _severity_gate(self, stress: pd.Series) -> pd.Series:

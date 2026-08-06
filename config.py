@@ -167,9 +167,10 @@ class _NSECostConfig:
     sebi_bps: float = 0.01              # SEBI turnover fee (0.0001%)
     stamp_duty_bps_buy: float = 1.5     # stamp duty 0.015%, BUY side only (delivery)
     gst_pct: float = 18.0               # GST on (brokerage + exchange + SEBI)
-    slippage_bps: float = 0.0           # FLAT market-impact / half-spread add-on. Still
-                                        # 0: the size-dependent term below supersedes it
-                                        # and is not yet wired into the execution path.
+    slippage_bps: float = 0.0           # FLAT market-impact / half-spread add-on. Kept
+                                        # at 0: superseded by the per-name spread +
+                                        # impact terms below (charge_per_name), which
+                                        # price the same thing without a constant.
     short_borrow_bps_annual: float = 50.0  # annual borrow on the short leg's gross
 
     # --- size-dependent market impact (used by src/phase4_data/capacity.py) --- #
@@ -185,6 +186,41 @@ class _NSECostConfig:
     impact_coef: float = 0.5
     max_participation: float = 0.10     # share of ADV a single position may consume
     adv_window: int = 21                # trailing bars for the ADV estimate
+
+    # ----------------------------------------------------------------------- #
+    # Phase 4c A3/A4 — per-name execution cost, wired into the execution path.
+    #
+    # Phase 4b charged only the ~14.66 bps statutory stack: zero spread and zero
+    # market impact, on a book turning over 0.45-0.82 per day with under 7 bps of
+    # headroom. These four fields are the fix, and every one of them is OFF by
+    # default — the Phase 2/3 and Phase 4b ledgers must reproduce bit-for-bit, so
+    # new cost behaviour is opt-in exactly like the halt bridge.
+    # ----------------------------------------------------------------------- #
+    charge_per_name: bool = False       # master gate. False => flat statutory rate on
+                                        # reduced turnover (the Phase 3/4b path).
+                                        # True  => per-(bar,name) statutory + measured
+                                        # half-spread + sqrt-law impact.
+    aum_rupees: float = 1e7             # Rs 1 crore — the documented operating point.
+                                        # Capacity does not bind here, so a failure at
+                                        # Rs 1 cr is a failure at every larger size.
+    spread_estimator: str = "cs"        # "cs" Corwin-Schultz (biased DOWN, ~6.0 bps
+                                        # pooled) | "ar" Abdi-Ranaldo (biased UP, ~26.1
+                                        # bps). The headline runs on "cs": if the edge
+                                        # dies under the optimistic estimate, the
+                                        # verdict does not depend on the choice.
+    enforce_participation_cap: bool = False  # A4: cap each position at
+                                        # max_participation of its ADV, redistributing
+                                        # within the leg so leg gross stays 1.0.
+
+    # --- B3 liquidity-tiered short borrow ---------------------------------- #
+    # The flat 50 bps/yr assumes unlimited availability at a uniform price, which is
+    # not how SLB works: borrow is cheap and deep for the large F&O names and scarce
+    # and expensive down the liquidity ladder. Frozen a-priori from published SLB fee
+    # ranges — a stated assumption, not a fitted parameter.
+    tiered_borrow: bool = False         # opt-in, like everything else above
+    borrow_bps_by_quartile: tuple[float, ...] = (25.0, 50.0, 100.0, 200.0)
+                                        # by trailing-turnover quartile of the eligible
+                                        # set, most liquid first
 
     @staticmethod
     def impact_bps(sigma: float, participation: float, coef: float = 0.5) -> float:
@@ -223,6 +259,36 @@ class _NSECostConfig:
         return 0.5 * (buy + sell)
 
 
+# --------------------------------------------------------------------------- #
+# The trial ledger (Phase 4c D1) — the honest N for the DSR deflation.
+#
+# "A grid of N cells is N implicit backtests." N is not the number of columns in
+# whatever file is being scored; it is the number of configurations the *program* has
+# searched to arrive at the one being reported. Phase 4b deflated against N=3 and two
+# cells passed. The tally below is that number, kept explicit and auditable here so it
+# can be challenged line by line rather than asserted.
+#
+# Judgment calls, stated so they can be argued with:
+#   - Phase 1 sandbox runs are EXCLUDED: synthetic data, a different question.
+#   - A gross/net re-measurement of an identical configuration is NOT a new trial —
+#     it is the same cell measured twice, not a new place to look.
+#   - Sensitivity cells ARE counted. Searching them is searching them, regardless of
+#     which ledger file they landed in.
+# --------------------------------------------------------------------------- #
+TRIAL_LEDGER: list[tuple[str, int, str]] = [
+    # (source, cells counted, rationale)
+    ("phase3 §3 net grid, 4 freq x 3 styles, 1b target", 12, "the headline search"),
+    ("phase3 §2 gross, same 12 configs", 0, "same cells measured without costs"),
+    ("phase3 §4 daily-only, 1b", 0, "a subset of the 12 above"),
+    ("phase3 §5 daily-only, 5b", 3, "new target => new configurations"),
+    ("phase3 §6 rebalance_buffer sensitivity (6 values)", 5, "mult=2.0 counted in §5"),
+    ("phase3 §7.3 multi-scale panic gate", 1, "tested and rejected — still a search"),
+    ("phase4b headline, daily_nse500 x 3 styles", 3, ""),
+    ("phase4c frozen grid, 3 styles x 2 targets", 6, "docs/phase4c_plan.md §5"),
+]
+TRIALS_SEARCHED: int = sum(n for _, n, _ in TRIAL_LEDGER)   # = 30
+
+
 @dataclass
 class _DSRConfig:
     """
@@ -230,11 +296,28 @@ class _DSRConfig:
     src/production_ml/tier4_dsr_gate.py and docs/phase3_design_requirements.md §0.
     """
     benchmark_sharpe: float = 0.0      # SR* floor for the plain PSR (per-period)
-    dsr_threshold: float = 0.95        # DSR pass line (P(true SR > deflated SR*))
+    dsr_threshold: float = 0.95        # DSR pass line (P(true SR > deflated SR*)).
+                                        # FROZEN. Moving a threshold after seeing
+                                        # results is the selection bias this gate
+                                        # exists to correct.
     common_frequency: str = "daily"    # all columns resampled here before scoring
-    trials_override: int | None = None  # N for the multiple-testing deflation;
-                                        # None => ledger column count. Set to the
-                                        # true number of cells searched (e.g. 12).
+    trials_override: int | None = TRIALS_SEARCHED  # N for the multiple-testing
+                                        # deflation (D1). None would fall back to the
+                                        # ledger's column count, which is the number
+                                        # of cells *reported*, not searched.
+
+    # --- D2: Lo (2002) autocorrelation correction -------------------------- #
+    # PSR/DSR assume i.i.d. daily returns. These returns are not: positions persist
+    # for days under a multi-day target, and measured lag-1 autocorrelation on the
+    # Phase 4b ledger is +0.09 to +0.14. Positive autocorrelation makes the naive
+    # sqrt(252) annualization overstate the Sharpe, so the correction is uniform and
+    # monotone AGAINST every strategy.
+    autocorr_adjust: bool = True
+    autocorr_horizon: int = 21          # variance-ratio horizon (trading days) behind
+                                        # the Lo scaling. Long enough to contain a
+                                        # whole position life at the slowest target in
+                                        # the grid, short enough to keep the estimator
+                                        # tight (sd ~0.05 at this sample length).
 
 
 @dataclass
@@ -266,6 +349,20 @@ class _Phase4Config:
     # buyout (Shumway 1997). Declared a-priori as a {0, -0.30, -1.00} sensitivity on
     # a SEPARATE ledger — freeze-before-test, like the rebalance-buffer sweep.
     delisting_return: float = -0.30
+
+    # --- Phase 4c cost/eligibility panels (src/phase4_data/) ---------------- #
+    adv_parquet: str = "data/bhavcopy/adv_daily.parquet"
+    sigma_parquet: str = "data/bhavcopy/sigma_daily.parquet"
+    spread_cs_parquet: str = "data/bhavcopy/spread_daily_cs.parquet"
+    spread_ar_parquet: str = "data/bhavcopy/spread_daily_ar.parquet"
+    # Point-in-time set of names carrying a live single-stock future, used as the
+    # availability proxy for SLB borrow. An UPPER bound on shortability — real SLB is
+    # thinner — because NSE publishes no historical SLB-eligibility archive.
+    shortable_mask_parquet: str = "data/bhavcopy/shortable_mask.parquet"
+    # Daily NIFTY-50 dividend yield (%/yr), read from the index archive's `Div Yield`
+    # column. Phase 4b's long_only verdict turned on an *assumed* flat 1.3%/yr; this
+    # replaces the assumption with the measurement.
+    div_yield_parquet: str = "data/bhavcopy/div_yield_daily.parquet"
 
 
 @dataclass
@@ -310,6 +407,36 @@ SENSITIVITY_BANDS: dict[str, list] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# The Phase 4c frozen grid (docs/phase4c_plan.md §5) — committed BEFORE the run.
+#
+# Six cells: 3 execution styles x 2 targets, on the 500-name point-in-time panel.
+# Everything else is fixed, and every knob below is stated here rather than passed
+# on a command line, so what ran is recoverable from the repo alone.
+#
+# ``long_only`` has no short leg, so Track B cannot touch it — it is the control
+# that isolates how much of the damage is Track A (spread + impact) by itself.
+# --------------------------------------------------------------------------- #
+PHASE4C_FREQUENCY: str = "daily_nse500"
+PHASE4C_STYLES: list[str] = ["long_only", "long_short_slb", "dynamic_tilt_slb"]
+PHASE4C_TARGETS: list[str] = ["tgt_fwd_logret_5b", "tgt_fwd_logret_21b"]
+PHASE4C_LEDGER: str = "data/trial_database/phase4c_dsr_matrix.parquet"
+
+# The cost regime the frozen grid runs under. ``spread_estimator="cs"`` is the
+# deliberately CHARITABLE choice: Corwin-Schultz pools to ~6.0 bps in-universe against
+# Abdi-Ranaldo's ~26.1, and on controlled synthetic data with a known planted spread it
+# is the one that under-reads. If the edge dies under the optimistic estimate, the
+# verdict does not depend on which estimator was picked.
+PHASE4C_COST_OVERRIDES: dict[str, object] = {
+    "charge_per_name": True,
+    "enforce_participation_cap": True,
+    "tiered_borrow": True,
+    "spread_estimator": "cs",
+    "aum_rupees": 1e7,      # Rs 1 crore — capacity does not bind here, so a failure
+                            # at this size is a failure at every larger one
+}
+
+
 @dataclass
 class StrategyConfig:
     is_simulation: bool
@@ -328,16 +455,35 @@ class StrategyConfig:
                                         # evicted once it drifts past
                                         # decile_pct*mult. >=1.0; 1.0 disables the
                                         # buffer (enter==exit). Turnover control.
+    target_col: str = "tgt_fwd_logret_1b"  # PRODUCTION_ML tree learning label. Part of
+                                        # the strategy's identity, not a runtime
+                                        # option: a model trained on a 5-day label is
+                                        # a different strategy from one trained on a
+                                        # 1-day label, and Phase 4c's frozen grid
+                                        # searches both (so both are paid for in N).
+                                        # Phase 3 kept them apart by writing separate
+                                        # ledger FILES, which does not scale to a grid
+                                        # that varies the target inside one ledger.
 
     @property
     def strategy_id(self) -> str:
-        _abbrev: dict[str, str] = {"long_only": "LO", "long_short": "LS", "dynamic_tilt": "DT"}
+        _abbrev: dict[str, str] = {
+            "long_only": "LO", "long_short": "LS", "dynamic_tilt": "DT",
+            # Phase 4c: the same two books with the short leg restricted to
+            # SLB-borrowable names. Distinct ids — they are different strategies,
+            # not corrections to the unrestricted ones.
+            "long_short_slb": "LSB", "dynamic_tilt_slb": "DTB",
+        }
         style_abbrev: str = _abbrev.get(self.execution_style, self.execution_style[:2].upper())
+        # "tgt_fwd_logret_5b" -> "T5B"; kept in the human-readable prefix so a ledger
+        # column says which label trained it without decoding the hash.
+        tgt_abbrev: str = "T" + self.target_col.rsplit("_", 1)[-1].upper()
         prefix: str = (
             f"STRAT_{self.market_type.upper()}"
             f"_{style_abbrev}"
             f"_L{self.lookback_period}"
             f"_HMM{self.hmm_states}"
+            f"_{tgt_abbrev}"
         )
 
         # All parameters included so every distinct permutation hashes uniquely
@@ -345,7 +491,7 @@ class StrategyConfig:
             f"{self.is_simulation}_{self.market_type}_{self.lookback_period}"
             f"_{self.hmm_states}_{self.execution_style}"
             f"_{self.top_n}_{self.bottom_n}_{self.frequency}_{self.decile_pct}"
-            f"_{self.rebalance_buffer_mult}"
+            f"_{self.rebalance_buffer_mult}_{self.target_col}"
         )
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 

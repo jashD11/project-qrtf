@@ -3,7 +3,7 @@ Phase 4 acquisition — bulk-download NSE bhavcopy and index archives.
 
 NSE publishes one file per trading day covering **every listed stock**, so the
 download cost scales with *days*, not *stocks*: a 68-name build and a 2,000-name
-build cost exactly the same. Three archives are needed, on ``nsearchives.nseindia.com``,
+build cost exactly the same. Four archives are needed, on ``nsearchives.nseindia.com``,
 which serves them to a plain ``User-Agent`` with no cookies and no session priming
 (unlike the ``www.nseindia.com/api/*`` surface, which is cookie-gated and rate-limited
 — this module deliberately never touches it):
@@ -14,6 +14,13 @@ which serves them to a plain ``User-Agent`` with no cookies and no session primi
            the replacement format, from ~2024-07. Same content, new column names.
     index  /content/indices/ind_close_all_<DDMMYYYY>.csv
            every NSE index close for the day; the Tier 2 regime market series.
+    fo     /content/historical/DERIVATIVES/<YYYY>/<MON>/fo<DD><MON><YYYY>bhav.csv.zip
+           /content/fo/BhavCopy_NSE_FO_0_0_0_<YYYYMMDD>_F_0000.csv.zip
+           the derivatives bhavcopy, same two eras as ``eq``. Phase 4c reads only the
+           stock-futures rows (``INSTRUMENT == "FUTSTK"`` legacy / ``FinInstrmTp ==
+           "STF"`` UDiFF) to derive a point-in-time **shortable** set: the names with a
+           live single-stock future are the availability proxy for SLB borrow. Derived
+           from *traded contracts*, so it carries no survivorship bias.
 
 Design notes
     - **Era router by probe, not by constant.** The eq/udiff cutover is tried in the
@@ -74,7 +81,7 @@ _HEADERS: Final[dict[str, str]] = {
 DEFAULT_OUT_DIR: Final[str] = "data/bhavcopy"
 MISSING_JSON: Final[str] = "_missing.json"
 
-KINDS: Final[tuple[str, ...]] = ("eq", "index")
+KINDS: Final[tuple[str, ...]] = ("eq", "index", "fo")
 _ERAS: Final[tuple[str, ...]] = ("eq", "udiff")  # both are the "eq" kind on disk
 
 # Format changeover, used only to order the two candidate URLs — never to decide
@@ -108,18 +115,39 @@ def _index(d: date) -> tuple[str, str]:
     return "index", f"{BASE}/content/indices/{name}"
 
 
+def _fo_old(d: date) -> tuple[str, str]:
+    """Legacy derivatives bhavcopy: (subdir, url). Same naming shape as ``_eq_old``."""
+    mon = _MONTHS[d.month - 1]
+    name = f"fo{d.day:02d}{mon}{d.year}bhav.csv.zip"
+    return "fo", f"{BASE}/content/historical/DERIVATIVES/{d.year}/{mon}/{name}"
+
+
+def _fo_udiff(d: date) -> tuple[str, str]:
+    """UDiFF derivatives bhavcopy: (subdir, url)."""
+    name = f"BhavCopy_NSE_FO_0_0_0_{d:%Y%m%d}_F_0000.csv.zip"
+    return "fo_udiff", f"{BASE}/content/fo/{name}"
+
+
+# Per-kind era pairs, ordered (legacy, udiff). A kind absent here is single-format.
+_ERA_BUILDERS: Final[dict[str, tuple]] = {
+    "eq": (_eq_old, _eq_udiff),
+    "fo": (_fo_old, _fo_udiff),
+}
+
+
 def candidates(kind: str, d: date) -> list[tuple[str, str]]:
     """
     Candidate ``(subdir, url)`` pairs for one (kind, date), most likely first.
 
-    The eq kind returns both era formats so the archive's own cutover decides which
-    one exists, rather than a hard-coded date in this file.
+    The two-era kinds (eq, fo) return both formats so the archive's own cutover
+    decides which one exists, rather than a hard-coded date in this file.
     """
     if kind == "index":
         return [_index(d)]
+    old, udiff = _ERA_BUILDERS[kind]
     if d >= _UDIFF_FROM:
-        return [_eq_udiff(d), _eq_old(d)]
-    return [_eq_old(d), _eq_udiff(d)]
+        return [udiff(d), old(d)]
+    return [old(d), udiff(d)]
 
 
 def target_path(out_dir: str, subdir: str, url: str) -> str:

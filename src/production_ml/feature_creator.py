@@ -43,8 +43,8 @@ Feature families (19 features total)
         liq_amihud, liq_vol_var_20b, liq_turnover_20b,
         inst_delivery_qty, inst_delivery_pct
 
-Targets (2)
-    tgt_fwd_logret_1b, tgt_fwd_logret_5b
+Targets (3)
+    tgt_fwd_logret_1b, tgt_fwd_logret_5b, tgt_fwd_logret_21b
 """
 
 import os
@@ -88,7 +88,14 @@ PARKINSON_WINDOW: Final[int] = 20
 DRAWDOWN_WINDOW: Final[int] = 252
 VOLVAR_WINDOW: Final[int] = 20
 TURNOVER_WINDOW: Final[int] = 20
-TARGET_HORIZONS: Final[tuple[int, ...]] = (1, 5)
+# Phase 4c C1 adds the 21-bar label. Turnover is the one axis with headroom left —
+# 1b -> 5b roughly halved it and was the single biggest net lift in Phase 3 — and a
+# monthly horizon is the untried step. Adding it does **not** change the emitted row
+# set: the keep rule is "at least one valid target", and a defined 21-bar label
+# implies a defined 5- and 1-bar one, so the OR is unchanged and Phase 2/3/4b panels
+# are byte-identical. It is committed as a frozen 2-point fork and paid for in N,
+# not scanned (docs/phase4c_plan.md §3, §4.1).
+TARGET_HORIZONS: Final[tuple[int, ...]] = (1, 5, 21)
 
 # --- Output schema (names derived from the horizons above) ----------------- #
 # Price-only families (always available, any frequency).

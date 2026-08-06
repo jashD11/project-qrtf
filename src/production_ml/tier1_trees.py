@@ -64,6 +64,7 @@ from src.production_ml.feature_creator import (
     FEATURE_COLUMNS,
     PRICE_FEATURE_COLUMNS,
     TARGET_COLUMNS,
+    TARGET_HORIZONS,
     present_feature_columns,
 )
 
@@ -525,12 +526,13 @@ def _make_dummy_features(
     feats = rng.uniform(-1.0, 1.0, size=(n_rows, n_feats))
     feat_df = pd.DataFrame(feats, index=index, columns=FEATURE_COLUMNS)
 
-    # Faint learnable signal + noise -> forward return targets.
+    # Faint learnable signal + noise -> forward return targets. Each horizon scales
+    # the signal by its own bar count and the noise by ~sqrt of it, so every entry in
+    # TARGET_COLUMNS is populated whatever horizons the factory is configured with.
     weights = rng.normal(0.0, 0.01, size=n_feats)
     signal = feats @ weights
-    noise = rng.normal(0.0, 0.02, size=n_rows)
-    feat_df[TARGET_COLUMNS[0]] = signal + noise
-    feat_df[TARGET_COLUMNS[1]] = 5.0 * signal + rng.normal(0.0, 0.045, size=n_rows)
+    for col, h in zip(TARGET_COLUMNS, TARGET_HORIZONS):
+        feat_df[col] = h * signal + rng.normal(0.0, 0.02 * np.sqrt(h), size=n_rows)
 
     return feat_df.sort_index()
 
