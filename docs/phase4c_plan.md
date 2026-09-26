@@ -8,8 +8,10 @@ deferred list in [`phase4_results.md`](phase4_results.md) §5.
 ## Context — why this phase exists
 
 Phase 4b ran the tree stack on the 500-name point-in-time panel and produced the
-project's first DSR passes: `long_short` 1.78 SR / DSR 1.000 and `dynamic_tilt` 1.37 /
-0.998, against `long_only` at 0.86 / 0.916. Taken at face value that reverses Phase 3's
+project's first DSR passes, **deflated against N = 3**: `long_short` 1.78 SR / DSR 0.99999
+and `dynamic_tilt` 1.37 / 0.99763, against `long_only` at 0.86 / 0.91553
+(`production_dsr_matrix_dsr_gate.csv`). The N is the point — this phase re-deflates the same
+cells against N = 30. Taken at face value that reverses Phase 3's
 negative result.
 
 It should not be taken at face value, for four reasons that this phase exists to

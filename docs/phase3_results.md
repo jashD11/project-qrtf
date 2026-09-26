@@ -68,6 +68,17 @@ bar autocorrelation — read `mean_IC`/`hit%`, not `IC_t`.)
 | rf | 0.0166 | 0.108 | 4.50 | 54.6% |
 | **ensemble** | **0.0234** | 0.147 | 6.12 | 55.8% |
 
+> **Artifact note.** `tree_fit_diagnostics_daily.csv` was overwritten on 2026-08-06 by a
+> 5-day-target run and is now byte-identical to `tree_fit_diagnostics_daily_5b.csv`, so the
+> 1-day daily row above **no longer has a backing artifact** (the 15/30/60-min rows still
+> match theirs exactly). The numbers are left as published rather than silently dropped.
+> Regenerate with:
+>
+>     python run_pipeline_ml.py --frequencies daily --target tgt_fwd_logret_1b --skip-dsr
+>
+> The §4 *returns* for the 1-day target are unaffected — they still verify against
+> `production_dsr_matrix_daily1b.parquet`.
+
 **Read:** genuine, statistically strong predictive skill that **decays monotonically
 with horizon** (ensemble IC 0.083 → 0.063 → 0.057 → 0.023). LightGBM leads at
 intraday; the ensemble wins at daily (IC_t 6.12). The trees really rank stocks —
@@ -107,6 +118,13 @@ by the inflated intraday cells sharing the N=12 family. Costs (§3) reveal the t
 
 The real economic verdict. DSR at N=12, benchmark SR\* = 12.02, cross-trial
 Sharpe std 0.455.
+
+**Cost basis for every net figure below:** 14.6558 bps per side, statutory NSE delivery
+only — brokerage 3.0 + STT 10.0 (both sides) + exchange 0.30 + SEBI 0.01 + stamp duty 1.5
+(buy side only) + 18% GST on the brokerage/exchange/SEBI base, plus 50 bps/yr borrow on the
+short leg. **Flat slippage is 0.0 and market impact is not charged here** (`config.py`
+`_NSECostConfig`), so these are a lower bound; Phase 4c charges the measured half-spread and
+√-law impact and reaches 24.5-26.1 bps/side.
 
 | freq | style | turnover/bar (vs gross) | cost drag /yr | net CumRet | SR_ann | DSR |
 |---|---|---|---|---|---|---|
@@ -292,11 +310,17 @@ horizon) and eventually a slippage/impact study on the surviving cell.
 
 | File | Contents |
 |---|---|
-| `production_dsr_matrix.parquet` | current ledger — daily-only N=3, **5-day target** (net, §5) |
-| `production_dsr_matrix_daily5b.parquet` | archived daily N=3 NET ledger — 5-day target (§5) |
-| `production_dsr_matrix_daily1b.parquet` | archived daily N=3 NET ledger — 1-day target (§4) |
-| `production_dsr_matrix_net12.parquet` | archived full 12-cell NET ledger (§3) |
-| `production_dsr_matrix_dsr_gate.csv` | latest DSR gate output |
-| `tree_fit_diagnostics_{15min,30min,60min,daily}.csv` | per-model rank-IC diagnostics, 1-day (§1) |
+| `archive/phase3_daily_dsr_matrix.parquet` | **the §5 ledger** — daily-only N=3, 5-day target (net). Verified +0.57 / −0.19 / +0.30 |
+| `production_dsr_matrix_daily5b.parquet` | identical copy of the above (§5) |
+| `production_dsr_matrix_daily1b.parquet` | daily N=3 NET ledger — 1-day target (§4). Verified +0.49 / −0.37 / +0.18 |
+| `production_dsr_matrix_net12.parquet` | full 12-cell NET ledger (§3). Verified against every row of §3 |
+| `tree_fit_diagnostics_{15min,30min,60min}.csv` | per-model rank-IC diagnostics, 1-day (§1) |
 | `tree_fit_diagnostics_daily_5b.csv` | daily per-model rank-IC diagnostics, 5-day target (§5) |
 | `production_sensitivity_dsr_matrix.parquet` | sensitivity-scan ledger — buffer-width band (§6) |
+
+**Two pointers moved after this document was written, and are corrected above.**
+`production_dsr_matrix.parquet` was **reused by the Phase 4b run** on 2026-08-06 (see
+[`phase4_results.md`](phase4_results.md) §0) and now holds three `daily_nse500` columns at
+SR +0.86 / +1.78 / +1.37 — not the §5 cells. The Phase 3 ledger was moved to
+`archive/phase3_daily_dsr_matrix.parquet` at that time, and `production_dsr_matrix_dsr_gate.csv`
+is likewise now the Phase 4b gate output, not this phase's.

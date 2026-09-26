@@ -254,14 +254,19 @@ annualized (against 0.39 at Phase 4b's N = 3).
 
 | target | style | gross SR | **net SR** | Lo-corrected | CumRet | bps/side | turnover | **DSR** |
 |---|---|---|---|---|---|---|---|---|
-| 5b | long_only | 1.66 | 0.18 | 0.16 | +15.4% | 26.1 | 0.45 | 0.007 |
-| 5b | long_short_slb | 1.88 | −0.99 | −0.91 | −74.4% | 24.5 | 0.64 | 0.000 |
-| 5b | dynamic_tilt_slb | 2.01 | −0.05 | −0.05 | −29.8% | 26.0 | 0.72 | 0.001 |
-| 21b | long_only | 1.12 | **0.30** | 0.27 | +43.2% | 26.0 | 0.24 | **0.017** |
-| 21b | long_short_slb | 0.96 | −0.57 | −0.52 | −56.5% | 24.5 | 0.34 | 0.000 |
-| 21b | dynamic_tilt_slb | 1.31 | 0.21 | 0.19 | +22.7% | 25.8 | 0.37 | 0.009 |
+| 5b | long_only | 1.660 | 0.178 | 0.161 | +15.44% | 26.08 | 0.446 | 0.00681 |
+| 5b | long_short_slb | 1.882 | −0.987 | −0.906 | −74.35% | 24.52 | 0.637 | 3.0e−09 |
+| 5b | dynamic_tilt_slb | 2.014 | −0.049 | −0.045 | −29.76% | 26.04 | 0.717 | 0.00092 |
+| 21b | long_only | 1.120 | **0.298** | 0.268 | +43.16% | 25.96 | 0.242 | **0.01650** |
+| 21b | long_short_slb | 0.958 | −0.567 | −0.520 | −56.47% | 24.46 | 0.338 | 2.0e−06 |
+| 21b | dynamic_tilt_slb | 1.308 | 0.212 | 0.192 | +22.72% | 25.81 | 0.370 | 0.00894 |
 
-### **0 of 6 cells pass. The best is DSR 0.017 against a 0.95 threshold.**
+Read to the precision the artifacts carry: `phase4c_dsr_matrix_dsr_gate.csv` (SR, Lo, DSR)
+and `phase4c_dsr_matrix_execution_diagnostics.csv` (gross, CumRet, bps, turnover). Net of
+24.5-26.1 bps/side realised — 14.6558 statutory + measured Corwin-Schultz half-spread +
+√-law impact at Rs 1 crore — plus tiered short borrow.
+
+### **0 of 6 cells pass. The best is DSR 0.0165 against a 0.95 threshold.**
 
 Not marginal — the best cell reaches under 2% of the required confidence. `minTRL` is
 undefined for every cell: none of them clears SR\* at *any* track length, so no amount of
