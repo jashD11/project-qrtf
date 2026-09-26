@@ -1,9 +1,15 @@
 # Phase 4 — engine results on the 500-name point-in-time panel
 
-**Status: PRELIMINARY.** The grid ran clean and the numbers below are real, but the
-result is not decision-grade until §5 item 1 (per-name spread + impact) is charged — see
-§3.1 for why that single item decides the verdict. Work continues in a later session;
-§6 records what is on disk.
+**Status: SUPERSEDED by [`phase4c_results.md`](phase4c_results.md).** The §5 item-1 work this
+document was waiting on (per-name spread + impact) was done, and it **overturned the result
+below**: `long_short` goes from SR 1.78 / DSR 0.99999 here to SR −0.23 once the measured
+half-spread and √-law impact are charged, and to −0.99 once the short leg is restricted to
+borrowable names. 0 of 6 Phase 4c cells pass the gate.
+
+This file is kept because it is the record of *what the corrections were applied to*, and
+because its ledger reproduces bit-for-bit under Phase 4c's defaults — that regression gate is
+what makes the comparison a measurement. **Read it as history, not as a current result.** Every
+number in it is real and was verified; the conclusion it points toward is not.
 
 **Run 2026-08-06.** `python run_pipeline_ml.py --frequencies daily_nse500 --target
 tgt_fwd_logret_5b` — grid `daily_nse500 × {long_only, long_short, dynamic_tilt}`,

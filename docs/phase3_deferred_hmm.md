@@ -1,5 +1,17 @@
 # Phase 3 Deferred Work — State-Conditional Execution & the HMM Axis
 
+> **Later finding, recorded here so this document is not read as the last word.**
+> This file frames the unused HMM states as *deferred wiring* — something to connect later.
+> [`phase5_plan.md`](phase5_plan.md) §1.1 measured the stronger version: `RegimeResult.states`,
+> `.probs` and `.stress` have **zero consumers anywhere in the repo**. Only `.panic` is read
+> (`run_pipeline_ml.py:349`), and `panic` never touches the HMM — it is
+> `mean(z_log_realized_vol, z_avg_corr)` thresholded at an expanding 85th percentile
+> (`tier2_regime.py:421-424`). So the fitted Gaussian HMM is not awaiting wiring; it is
+> decorative as currently built, and any estimator upgrade is a no-op until Tier 3 is
+> rewired. §1.2 there also finds the gate correlates 0.907 with a plain 21-day realised-vol
+> z-score.
+
+
 Living record of PRODUCTION_ML execution ideas that are **designed-for but
 deliberately not built yet**, so a future session can pick them up without
 re-deriving the reasoning. Everything here was consciously deferred while
