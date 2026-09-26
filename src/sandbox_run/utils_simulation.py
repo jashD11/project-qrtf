@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Union
 
 import numpy as np
@@ -155,7 +156,16 @@ def generate_synthetic_daily_data(
 
 
 def save_mock_data(df: pd.DataFrame, path: str) -> None:
-    """Saves a price DataFrame to CSV at the specified path."""
+    """
+    Saves a price DataFrame to CSV at the specified path.
+
+    Creates the parent directory if it is absent. ``data/`` is gitignored, so on a
+    fresh clone ``data/raw_nse/`` does not exist and the write would fail — which
+    made the one pipeline that needs no downloaded data unrunnable from a checkout.
+    """
+    parent: str = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     df.to_csv(path)
 
 
