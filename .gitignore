@@ -7,3 +7,5 @@ __pycache__/
 CLAUDE.md
 profile.txt
 .claude/settings.local.json
+# LaTeX build artefacts from scripts/build_beamer.py
+docs/presentation/*.log
