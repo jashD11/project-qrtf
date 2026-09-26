@@ -1,9 +1,18 @@
 # Phase 1 POC — Final Performance Results
 
+> **These are SIMULATED results and carry no economic meaning.** Prices are two-phase
+> non-stationary GBM from `src/sandbox_run/utils_simulation.py` (seed 42) over a synthetic
+> 10-stock universe — not market data. **No transaction costs are charged**, so every return
+> below is gross, and **no Deflated Sharpe Ratio is computed** in Phase 1. The HMM is fitted on
+> all history and decoded with Viterbi global MAP (`src/sandbox_run/tier2_regime.py:54-55`), so
+> these regime numbers are **in-sample**. Phase 1 was an architecture proof-of-concept: it
+> verified the plumbing of Tiers 0-4, nothing about NSE. For real results see
+> [`phase4c_results.md`](phase4c_results.md).
+
 **Run date:** 2026-06-21  
 **Pipeline:** `python run_pipeline.py`  
 **Configurations:** 12 (4 market profiles × 3 execution styles)  
-**Observation window:** 494 trading days (2024-02-08 → 2025-12-31)  
+**Observation window:** 494 trading days (2024-02-08 → 2025-12-30, per the ledger index)  
 **Universe:** 10 stocks with asymmetric drift profiles (3 alpha / 4 junk / 3 decadent)
 
 ---
