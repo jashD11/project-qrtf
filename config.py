@@ -437,6 +437,21 @@ PHASE4C_COST_OVERRIDES: dict[str, object] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5 — cost-aware construction, pre-registered (docs/phase5_plan.md §7).
+#
+# Frozen from theory before any result exists; none of these is tuned on returns.
+# The grid (Phase 4c grid x PHASE5_CONSTRUCTIONS) enters TRIAL_LEDGER at the freeze.
+# --------------------------------------------------------------------------- #
+PHASE5_CONSTRUCTIONS: list[str] = ["cost_band", "cost_swap"]
+PHASE5_LEDGER: str = "data/trial_database/phase5_dsr_matrix.parquet"
+PHASE5_BAND_EXPONENT: float = 1.0 / 3.0   # M1: exit band ∝ cost^(1/3) — small-cost
+                                          # no-trade asymptotics (Rogers 2004)
+PHASE5_SWAP_KAPPA: float = 1.0            # M2: swap iff expected gain > 1.0 x round-trip cost
+PHASE5_IC_WINDOW: int = 252               # M2: trailing observations for the causal IC
+PHASE5_IC_MIN_OBS: int = 126              # M2: below this, behave as the baseline buffer
+
+
 @dataclass
 class StrategyConfig:
     is_simulation: bool
