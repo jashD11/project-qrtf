@@ -145,6 +145,102 @@ def expected_return(
 
 
 # --------------------------------------------------------------------------- #
+# Shared buffer scaffolding
+# --------------------------------------------------------------------------- #
+def _buffer_setup(alpha_scores, cfg, short_scores):
+    """Ranks, per-bar widths and output arrays, exactly as ``apply_rebalance_buffer``."""
+    from src.production_ml.tier3_execution import base_style
+
+    do_short = base_style(cfg.execution_style) in ("long_short", "dynamic_tilt")
+    short_src = alpha_scores if short_scores is None else short_scores
+    rank_desc = alpha_scores.rank(axis=1, ascending=False, method="first").to_numpy()
+    rank_asc = short_src.rank(axis=1, ascending=True, method="first").to_numpy()
+    valid_counts = alpha_scores.notna().sum(axis=1).to_numpy()
+    shape = alpha_scores.shape
+    return (do_short, rank_desc, rank_asc, valid_counts,
+            np.zeros(shape, dtype=np.int8), np.zeros(shape, dtype=np.int8))
+
+
+def _widths(n: int, decile_pct: float, mult: float) -> tuple[int, int]:
+    """``k_enter`` and the baseline ``k_exit`` — the same arithmetic as the baseline."""
+    k_enter = max(1, int(np.floor(n * decile_pct)))
+    k_exit = max(k_enter, min(int(np.floor(n * decile_pct * mult)), n // 2))
+    return k_enter, k_exit
+
+
+def _fill(rank_row: np.ndarray, retained: list[int], k_enter: int) -> list[int]:
+    """Best-ranked enter-band names not already held, in rank order."""
+    enter_cols = np.where(rank_row <= k_enter)[0]
+    enter_cols = enter_cols[np.argsort(rank_row[enter_cols])]
+    keep = set(retained)
+    return [int(c) for c in enter_cols if int(c) not in keep]
+
+
+def _to_masks(alpha_scores, held_long, held_short):
+    idx, cols = alpha_scores.index, alpha_scores.columns
+    return (pd.DataFrame(held_long, index=idx, columns=cols),
+            pd.DataFrame(-held_short, index=idx, columns=cols))
+
+
+# --------------------------------------------------------------------------- #
+# §7.3 — M1: cost-scaled buffer
+# --------------------------------------------------------------------------- #
+def apply_cost_band_buffer(
+    alpha_scores: pd.DataFrame,
+    cfg,
+    cost_bps: pd.DataFrame,
+    short_scores: pd.DataFrame | None = None,
+    exponent: float = config.PHASE5_BAND_EXPONENT,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    The baseline two-band buffer with a per-name exit band scaled by trading cost.
+
+        k_exit_i,t = max(k_enter, min(floor(n·d·mult·(c_i,t / median_t c)^(1/3)), n//2))
+
+    ``median_t c`` is taken over the names scored on bar t. A median-cost name keeps the
+    baseline band exactly; an expensive name is held through a wider rank drift, a cheap
+    one is released sooner. Entry, fill order, book width and the short leg's
+    eligibility handling are the baseline's, line for line — only the retention test
+    reads ``k_exit[c]`` instead of one ``k_exit``. Ranks only, so the cold-fit jitter in
+    raw alpha cannot move it. With every cost equal it *is* ``apply_rebalance_buffer``.
+    """
+    do_short, rank_desc, rank_asc, valid_counts, held_long, held_short = _buffer_setup(
+        alpha_scores, cfg, short_scores
+    )
+    cost = cost_bps.reindex(index=alpha_scores.index, columns=alpha_scores.columns)
+    cost = cost.where(alpha_scores.notna()).to_numpy()
+    ratio = cost / np.nanmedian(cost, axis=1, keepdims=True) if cost.size else cost
+    scale = ratio ** exponent
+    d, mult = cfg.decile_pct, cfg.rebalance_buffer_mult
+
+    def _leg(rank_row, prev, k_enter, k_exit_row):
+        retained = [c for c in prev if rank_row[c] <= k_exit_row[c]]
+        retained.sort(key=lambda c: rank_row[c])
+        if len(retained) >= k_enter:
+            return retained[:k_enter]
+        return retained + _fill(rank_row, retained, k_enter)[: k_enter - len(retained)]
+
+    prev_long: list[int] = []
+    prev_short: list[int] = []
+    for t in range(len(alpha_scores.index)):
+        n = int(valid_counts[t])
+        if n == 0:
+            prev_long, prev_short = [], []
+            continue
+        k_enter, _ = _widths(n, d, mult)
+        raw = np.floor(n * d * mult * scale[t])
+        k_exit_row = np.maximum(k_enter, np.minimum(raw, n // 2))   # NaN for unscored names
+
+        prev_long = _leg(rank_desc[t], prev_long, k_enter, k_exit_row)
+        held_long[t, prev_long] = 1
+        if do_short:
+            prev_short = _leg(rank_asc[t], prev_short, k_enter, k_exit_row)
+            held_short[t, prev_short] = 1
+
+    return _to_masks(alpha_scores, held_long, held_short)
+
+
+# --------------------------------------------------------------------------- #
 # Dry-run verification
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -220,6 +316,98 @@ if __name__ == "__main__":
     checks["decision cost has no NaN"] = bool(c.notna().all().all())
     checks["decision cost >= statutory"] = bool((c >= cost_cfg.compose_oneway_bps()).all().all())
     checks["decision cost == per_name_cost_bps at 1/k"] = bool(c.equals(ref))
+
+    # ---- M1: cost-scaled buffer ----------------------------------------- #
+    from config import StrategyConfig
+    from src.production_ml.tier1_trees import WalkForwardResult
+    from src.production_ml.tier3_execution import apply_rebalance_buffer, run_execution
+
+    def _cfg(style, construction="buffer"):
+        return StrategyConfig(
+            is_simulation=False, market_type="dryrun", lookback_period=0, hmm_states=2,
+            execution_style=style, frequency="daily", construction=construction,
+        )
+
+    # A persistent signal (AR(1), phi=0.9) so the buffer actually has incumbents to keep;
+    # one name leaves the universe mid-sample, and a third of names are unborrowable.
+    nb, nn = 300, 60
+    bdates = pd.bdate_range("2019-01-01", periods=nb)
+    bnames = pd.Index([f"B{i:02d}" for i in range(nn)])
+    sig = np.zeros((nb, nn))
+    sig[0] = rng.normal(size=nn)
+    for t_ in range(1, nb):
+        sig[t_] = 0.9 * sig[t_ - 1] + np.sqrt(1 - 0.81) * rng.normal(size=nn)
+    balpha = pd.DataFrame(sig, index=bdates, columns=bnames)
+    balpha.iloc[150:, 7] = np.nan
+    shortable = pd.DataFrame(rng.random((nb, nn)) > 0.33, index=bdates, columns=bnames)
+    sscores = balpha.where(shortable)
+
+    flat_cost = pd.DataFrame(20.0, index=bdates, columns=bnames)
+    for style, ss in (("long_short", None), ("long_short_slb", sscores)):
+        base_l, base_s = apply_rebalance_buffer(balpha, _cfg(style), short_scores=ss)
+        m1_l, m1_s = apply_cost_band_buffer(balpha, _cfg(style), flat_cost, short_scores=ss)
+        checks[f"M1 equal costs == baseline buffer ({style})"] = bool(
+            m1_l.equals(base_l) and m1_s.equals(base_s)
+        )
+
+    het_cost = pd.DataFrame(rng.lognormal(3.0, 0.8, (nb, nn)), index=bdates, columns=bnames)
+    m1_l, m1_s = apply_cost_band_buffer(balpha, _cfg("long_short_slb"), het_cost, short_scores=sscores)
+    n_valid_b = balpha.notna().sum(axis=1)
+    k_enter_b = np.floor(n_valid_b * 0.10).clip(lower=1)
+    checks["M1 long leg sized k_enter"] = bool((m1_l.sum(axis=1) == k_enter_b).all())
+    checks["M1 short leg only borrowable names"] = bool(
+        not ((m1_s < 0) & ~shortable).to_numpy().any()
+    )
+    checks["M1 heterogeneous costs change the book"] = bool(not m1_l.equals(base_l))
+
+    # Hand-built case: n=20, d=0.10 -> k_enter=2, baseline k_exit=4. A and B held; both
+    # drift to ranks 5 and 6. Baseline evicts both. A costs 8x the median -> band x2 ->
+    # k_exit 8, kept. B costs 1/8 the median -> band x0.5 -> k_exit clipped to 2, evicted.
+    hn = pd.Index([f"H{i:02d}" for i in range(20)])
+    hd = pd.bdate_range("2020-01-01", periods=2)
+    ha = pd.DataFrame([np.arange(20, 0, -1.0), np.arange(20, 0, -1.0)], index=hd, columns=hn)
+    ha.iloc[1, [0, 1, 4, 5]] = ha.iloc[1, [4, 5, 0, 1]].to_numpy()   # A,B fall to ranks 5,6
+    hc = pd.DataFrame(10.0, index=hd, columns=hn)
+    hc.iloc[:, 0], hc.iloc[:, 1] = 80.0, 1.25
+    hb_l, _ = apply_rebalance_buffer(ha, _cfg("long_only"))
+    h1_l, _ = apply_cost_band_buffer(ha, _cfg("long_only"), hc)
+    held_base = set(hb_l.columns[hb_l.iloc[1] == 1])
+    held_m1 = set(h1_l.columns[h1_l.iloc[1] == 1])
+    checks["baseline evicts both drifted names"] = held_base == {"H04", "H05"}
+    checks["M1 keeps the costly one, drops the cheap one"] = held_m1 == {"H00", "H04"}
+
+    # End to end through run_execution under per-name costs.
+    bprice = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, 0.01, (nb, nn)), axis=0)),
+                          index=bdates, columns=bnames)
+    bprice.iloc[151:, 7] = np.nan
+    bpanels = CostPanels(
+        adv=pd.DataFrame(rng.uniform(5e6, 5e8, (nb, nn)), index=bdates, columns=bnames),
+        sigma=pd.DataFrame(rng.uniform(0.01, 0.04, (nb, nn)), index=bdates, columns=bnames),
+        half_spread_bps=pd.DataFrame(rng.uniform(2, 40, (nb, nn)), index=bdates, columns=bnames),
+        shortable=shortable,
+    )
+    bwf = WalkForwardResult(alpha_scores=balpha, long_mask=balpha * 0, short_mask=balpha * 0)
+    bpanic = pd.Series(False, index=bdates)
+    saved = config.ML_CONFIG.cost
+    config.ML_CONFIG.cost = replace(saved, charge_per_name=True, aum_rupees=1e7)
+    try:
+        term = pd.Series({"B07": -0.30})
+        r_base = run_execution(bwf, bpanic, bprice, _cfg("long_short_slb"),
+                               terminal_returns=term, panels=bpanels)
+        r_m1 = run_execution(bwf, bpanic, bprice, _cfg("long_short_slb", "cost_band"),
+                             terminal_returns=term, panels=bpanels)
+    finally:
+        config.ML_CONFIG.cost = saved
+    checks["M1 end-to-end: net NaN-free"] = bool(r_m1.net.notna().all())
+    checks["M1 end-to-end: dollar-neutral"] = bool(
+        np.allclose(r_m1.net_exposure.to_numpy(), 0.0, atol=1e-9)
+    )
+    checks["M1 end-to-end: book differs from baseline"] = bool(not r_m1.weights.equals(r_base.weights))
+    try:
+        run_execution(bwf, bpanic, bprice, _cfg("long_only", "cost_band"), panels=bpanels)
+        checks["M1 refuses to run without per-name costs"] = False
+    except ValueError:
+        checks["M1 refuses to run without per-name costs"] = True
 
     print()
     print("=" * 70)
