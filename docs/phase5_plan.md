@@ -333,6 +333,94 @@ around this today by string-prefixing (`run_pipeline_ml.py:475`).
 
 ---
 
+## 7 · Pre-registration: cost-aware construction
+
+**Committed before any Phase 5 cost-aware number exists.** Everything in this section is
+frozen. Changing any of it after results are seen is the selection bias the DSR gate exists
+to correct, and would have to be paid for in N.
+
+### 7.1 · The ceiling that frames it
+
+Scoring the Phase 4c **gross** ledger at N=30 (`run_dsr_gate(phase4c_dsr_matrix_gross.parquet,
+n_trials=30, persist=False)`) — i.e. every cost set to zero:
+
+| cell | SR_ann (Lo) | DSR | passes at zero cost |
+|---|---|---|---|
+| `dynamic_tilt_slb` / 5b | 1.89 | 0.998 | yes |
+| `long_short_slb` / 5b | 1.75 | 0.996 | yes |
+| `long_only` / 5b | 1.48 | 0.967 | yes |
+| `dynamic_tilt_slb` / 21b | 1.18 | 0.841 | no |
+| `long_only` / 21b | 1.00 | 0.681 | no |
+| `long_short_slb` / 21b | 0.90 | 0.574 | no |
+
+A cost-aware rule can move a cell's net Sharpe towards its gross, not past it. So
+`long_only`/21b — the only net-positive cell — **cannot pass by cost reduction alone**; the
+only headroom is in the 5b cells, which carry 30–47%/yr trade drag. That is why the method
+is judged on all six cells, not aimed at the one that reads best.
+
+### 7.2 · Decision cost
+
+For name *i* on bar *t*, the one-way cost of trading a full position (bps):
+
+    c_i,t = statutory  +  half_spread_i,t  +  impact(σ_i,t, participation_i,t)
+    participation_i,t = (aum_rupees / k_t) / ADV_i,t
+
+Built from the Phase 4c cost panels through `align_cost_panel` (gaps take the date's
+cross-sectional median — never NaN) and the same square-root impact law as
+`per_name_cost_bps`. The panels' windows already end at t−1, so row t is causal.
+
+### 7.3 · M1 — cost-scaled buffer (`construction = "cost_band"`)
+
+The baseline buffer gives every name the same exit band, `k_exit = floor(n·d·2.0)`. M1 gives
+each name its own:
+
+    k_exit_i,t = clip( floor( n·d·2.0 · (c_i,t / median_t c)^(1/3) ),  k_enter,  n // 2 )
+
+A median-cost name keeps today's band; an expensive name must drift further before it is
+evicted; a cheap one is evicted sooner. The **1/3 exponent** is the small-cost asymptotic
+width of the no-trade region (Rogers 2004; Janeček & Shreve 2004), not a fitted number. The
+anchor 2.0 is the frozen Phase 3 headline multiplier. Entry is unchanged. M1 reads ranks
+only, so the ≤5.6e-17 cold-fit jitter in raw scores cannot flip it.
+
+### 7.4 · M2 — swap only if it pays (`construction = "cost_swap"`)
+
+Runs on the baseline 2.0 buffer. An incumbent that falls outside the exit band becomes an
+**eviction candidate** instead of being evicted. Expected *h*-day return, Grinold form:
+
+    E_i,t = IC_t · σ_i,t · √h · z_i,t
+
+with z the cross-sectional z-score of alpha on bar t and h the target horizon (5 or 21).
+Entrants (best first) are paired with candidates (worst first); each pair swaps only if
+
+    round( E_in − E_out − κ · (c_in + c_out) / 1e4 , 12 ) > 0,     κ = 1
+
+mirrored on the short leg. A name that leaves the universe, or loses its borrow on the short
+leg, is always evicted; empty slots are always filled. Rounding at 1e-12 is below every
+economic magnitude and far above the cold-fit jitter.
+
+**IC_t** is the trailing mean over 252 observations of the daily cross-sectional Spearman
+correlation between alpha on bar s and the realised h-day log return from s, using only
+s with s + h ≤ t − 1 (an h+1-bar embargo). With fewer than 126 observations M2 behaves
+exactly as the baseline buffer. IC ≤ 0 is clamped to 0, meaning no discretionary swaps.
+
+### 7.5 · Grid, criteria, stop rule, N
+
+- **Grid:** the Phase 4c frozen grid × {`cost_band`, `cost_swap`} = **12 new cells**, same
+  cost regime (`PHASE4C_COST_OVERRIDES`). The run also writes the six `buffer` cells into the
+  same ledger; they must equal Phase 4c bit-for-bit.
+- **Headline:** any new cell with DSR > 0.95 at **N = 42**.
+- **Secondary:** for every one of the 12 cells, Δ net Sharpe, Δ turnover and Δ trade drag
+  against its Phase 4c counterpart. All reported; none selected.
+- **Stop rule:** if no cell passes, the cross-sectional alpha line closes for this program.
+  No follow-up tuning of κ, the exponent, or further construction variants — that would be
+  search, not evidence.
+- **N accounting:** the 12 cells take N from 30 to 42, entered in `config.TRIAL_LEDGER`
+  before the run. The perfect-foresight short-leg test and the swap attribution count 0
+  (infeasible by construction / read-only on already-searched cells), each on a 0-cell
+  ledger line with its rationale.
+
+---
+
 ## Reference
 
 - Result this responds to: [`phase4c_results.md`](phase4c_results.md)
