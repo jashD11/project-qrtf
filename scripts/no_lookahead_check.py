@@ -56,7 +56,7 @@ TARGET = "tgt_fwd_logret_21b"
 STYLES = ["long_only", "long_short_slb"]      # the long-only control + the SLB short path
 # Every portfolio construction the engine can run (docs/phase5_plan.md §7). The Phase 5
 # ones read cost panels, sigma and (M2) a trailing IC from prices — all scrambled below.
-CONSTRUCTIONS = ["buffer", "cost_band"]
+CONSTRUCTIONS = ["buffer", "cost_band", "cost_swap"]
 CUT_FRACTIONS = [0.25, 0.50, 0.75]           # cut dates as a share of the scored bars
 SEED = 7
 

@@ -718,8 +718,16 @@ def run_execution(
             long_mask, short_mask = cost_aware.apply_cost_band_buffer(
                 alpha, cfg, decision_cost, short_scores=short_scores
             )
-        else:
-            raise NotImplementedError(construction)
+        else:  # cost_swap — needs the causal IC (from realised prices) and sigma
+            horizon = cost_aware.target_horizon(cfg.target_col)
+            ic = cost_aware.trailing_ic(alpha, price_wide, horizon)
+            sigma = align_cost_panel(
+                panels.sigma, alpha.index, alpha.columns, "sigma(E)", verbose=False
+            )
+            exp_ret = cost_aware.expected_return(alpha, sigma, ic, horizon)
+            long_mask, short_mask = cost_aware.apply_cost_swap_buffer(
+                alpha, cfg, decision_cost, exp_ret, short_scores=short_scores
+            )
     elif cfg.rebalance_buffer_mult > 1.0:
         long_mask, short_mask = apply_rebalance_buffer(alpha, cfg, short_scores=short_scores)
     else:
