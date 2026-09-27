@@ -100,6 +100,9 @@ class ExecutionResult:
     net_exposure: pd.Series      # sum w per bar (drives the dividend accrual, E5)
     short_gross: pd.Series
     diagnostics: dict            # scalars worth printing / recording
+    weights: pd.DataFrame | None = None  # final (bar x ticker) book, for read-only
+                                         # diagnostics (Phase 5 swap attribution,
+                                         # short-leg oracle); never written to a ledger
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +159,7 @@ def build_weight_matrix(
     panic: pd.Series,
     cfg: StrategyConfig,
     max_weight: pd.DataFrame | None = None,
+    short_scale: pd.Series | None = None,
 ) -> pd.DataFrame:
     """
     Build the (bar x ticker) portfolio weight matrix for one execution style.
@@ -170,6 +174,9 @@ def build_weight_matrix(
                     participation cap (A4). Applied to each leg's ``1/k`` weights
                     **before** the style branch, so all styles inherit it, with the
                     residual redistributed inside the leg (see ``cap_leg_weights``).
+        short_scale: optional per-bar multiplier in [0, 1] on the short leg's weights
+                    (Phase 5 §5 step 2 — the short-leg exposure scalar the oracle
+                    ceiling test drives). ``None`` takes the exact pre-Phase-5 path.
 
     Returns:
         (bar x ticker) float weight matrix. Row gross/net exposure by style:
@@ -198,6 +205,12 @@ def build_weight_matrix(
         long_w = cap_leg_weights(long_w, max_weight)
         short_w = cap_leg_weights(short_w, max_weight)
 
+    if short_scale is not None:
+        scale = short_scale.reindex(short_w.index)
+        if bool(scale.isna().any()) or bool(((scale < 0.0) | (scale > 1.0)).any()):
+            raise ValueError("short_scale must cover every bar with values in [0, 1]")
+        short_w = short_w.mul(scale.astype(float), axis=0)
+
     panic_bool: pd.Series = (
         panic.reindex(long_mask.index, fill_value=False).astype(bool)
     )
@@ -214,10 +227,10 @@ def build_weight_matrix(
     else:  # dynamic_tilt — regime-conditional leverage, never flat.
         ex = config.ML_CONFIG.execution
         flag: np.ndarray = panic_bool.to_numpy(dtype=float)[:, None]  # (bars, 1)
-        long_scale: np.ndarray = ex.calm_long_lev * (1.0 - flag) + ex.panic_long_lev * flag
-        short_scale: np.ndarray = ex.calm_short_lev * (1.0 - flag) + ex.panic_short_lev * flag
+        long_lev: np.ndarray = ex.calm_long_lev * (1.0 - flag) + ex.panic_long_lev * flag
+        short_lev: np.ndarray = ex.calm_short_lev * (1.0 - flag) + ex.panic_short_lev * flag
         weights = pd.DataFrame(
-            long_scale * long_w.to_numpy() - short_scale * short_w.to_numpy(),
+            long_lev * long_w.to_numpy() - short_lev * short_w.to_numpy(),
             index=long_mask.index,
             columns=long_mask.columns,
         )
@@ -620,6 +633,7 @@ def run_execution(
     cfg: StrategyConfig,
     terminal_returns: pd.Series | None = None,
     panels: CostPanels | None = None,
+    short_scale: pd.Series | None = None,
 ) -> ExecutionResult:
     """
     Realize one PRODUCTION_ML strategy, returning gross, net and every cost component.
@@ -637,6 +651,9 @@ def run_execution(
         panels:     optional pre-loaded Phase 4c cost panels. Loaded on demand when
                     absent and needed; passing them in avoids re-reading Parquet
                     once per style.
+        short_scale: optional per-bar short-leg multiplier in [0, 1], passed through
+                    to ``build_weight_matrix``. ``None`` (the default) is the exact
+                    pre-Phase-5 path.
 
     Phase 4c behaviour (per-name spread/impact, participation cap, SLB restriction,
     tiered borrow) is entirely gated on ``ML_CONFIG.cost`` flags that default to False
@@ -700,7 +717,8 @@ def run_execution(
         max_weight = cost_cfg.max_participation * adv / cost_cfg.aum_rupees
 
     weights: pd.DataFrame = build_weight_matrix(
-        long_mask, short_mask, panic_bars, cfg, max_weight=max_weight
+        long_mask, short_mask, panic_bars, cfg, max_weight=max_weight,
+        short_scale=short_scale,
     )
 
     # Forward returns on the full price history, then aligned to the scored bars.
@@ -824,6 +842,7 @@ def run_execution(
         net_exposure=weights.sum(axis=1).reindex(live),
         short_gross=short_gross.reindex(live),
         diagnostics=diagnostics,
+        weights=weights.reindex(live),
     )
 
 
@@ -1136,6 +1155,27 @@ if __name__ == "__main__":
     )
 
     checks.update(c4)
+
+    # 8. Phase 5 short-leg exposure scalar: all-ones must be the untouched path,
+    #    all-zeros must remove the short leg and leave the long leg alone.
+    cfg_ls = StrategyConfig(
+        is_simulation=False, market_type="dryrun", lookback_period=0,
+        hmm_states=2, execution_style="long_short", frequency="daily",
+    )
+    W_none = build_weight_matrix(wf.long_mask, wf.short_mask, panic, cfg_ls)
+    ones = pd.Series(1.0, index=wf.long_mask.index)
+    W_one = build_weight_matrix(wf.long_mask, wf.short_mask, panic, cfg_ls, short_scale=ones)
+    W_zero = build_weight_matrix(wf.long_mask, wf.short_mask, panic, cfg_ls, short_scale=0.0 * ones)
+    checks["short_scale=1 == no scalar (bit-for-bit)"] = bool(W_one.equals(W_none))
+    checks["short_scale=0 removes the short leg"] = bool(
+        (W_zero >= 0).to_numpy().all() and W_zero.equals(W_none.clip(lower=0.0))
+    )
+    res_none = run_execution(wf, panic, price_wide, cfg_ls)
+    res_one = run_execution(wf, panic, price_wide, cfg_ls, short_scale=ones)
+    checks["run_execution short_scale=1 == None"] = bool(res_one.net.equals(res_none.net))
+    checks["ExecutionResult carries the weights"] = bool(
+        res_none.weights is not None and res_none.weights.index.equals(res_none.net.index)
+    )
 
     print()
     print("=" * 70)
