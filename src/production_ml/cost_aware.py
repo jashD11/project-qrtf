@@ -241,6 +241,98 @@ def apply_cost_band_buffer(
 
 
 # --------------------------------------------------------------------------- #
+# §7.4 — M2: swap only if it pays
+# --------------------------------------------------------------------------- #
+def _swap_leg(
+    rank_row: np.ndarray, prev: list[int], k_enter: int, k_exit: int,
+    e_row: np.ndarray, c_row: np.ndarray, ic_ok: bool, kappa: float,
+) -> list[int]:
+    """
+    One leg, one bar. ``e_row`` is already signed for the leg (short: -E).
+
+    Incumbents inside the exit band are retained exactly as in the baseline. An incumbent
+    outside it but still rankable (in the universe and, on the short leg, borrowable) is
+    an eviction *candidate*: slots it could hold are contested, the rest are empty. Empty
+    slots are filled with the best-ranked entrants unconditionally. The next entrants,
+    best first, are paired with the contested candidates, worst first, and a pair swaps
+    only if ``round(E_in - E_out - kappa·(c_in + c_out)/1e4, 12) > 0``.
+    """
+    retained = [c for c in prev if rank_row[c] <= k_exit]
+    retained.sort(key=lambda c: rank_row[c])
+    if len(retained) >= k_enter:
+        return retained[:k_enter]
+    fill = _fill(rank_row, retained, k_enter)
+    slots = k_enter - len(retained)
+    if not ic_ok:
+        return retained + fill[:slots]
+
+    keep = set(retained)
+    candidates = [c for c in prev if c not in keep and np.isfinite(rank_row[c])]
+    candidates.sort(key=lambda c: -e_row[c])                 # best expected return first
+    contested = candidates[:slots]                           # at most one per open slot
+    empties = slots - len(contested)
+    book = retained + fill[:empties]
+    challengers = fill[empties:]
+
+    for j, cand in enumerate(sorted(contested, key=lambda c: e_row[c])):   # worst first
+        if j < len(challengers):
+            ent = challengers[j]
+            gain = e_row[ent] - e_row[cand] - kappa * (c_row[ent] + c_row[cand]) / 1e4
+            # NaN = no estimate for this pair -> baseline behaviour (swap). Only NaN:
+            # kappa=inf gives gain=-inf, which is a decision (hold), not a gap.
+            if np.isnan(gain) or round(float(gain), ROUND_DECIMALS) > 0:
+                book.append(ent)
+                continue
+        book.append(cand)
+    return book
+
+
+def apply_cost_swap_buffer(
+    alpha_scores: pd.DataFrame,
+    cfg,
+    cost_bps: pd.DataFrame,
+    exp_ret: pd.DataFrame,
+    short_scores: pd.DataFrame | None = None,
+    kappa: float = config.PHASE5_SWAP_KAPPA,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    The baseline 2.0 buffer, except a drifted incumbent is replaced only when it pays.
+
+    ``exp_ret`` is ``expected_return(...)``: NaN on bars where the IC is not yet
+    estimable, where this reproduces ``apply_rebalance_buffer`` exactly. With
+    ``kappa = 0`` and cross-sectionally constant σ it also reproduces the baseline (every
+    entrant out-ranks every candidate); with ``kappa = inf`` only forced exits and empty
+    slots trade. Book width stays ``k_enter``; the short leg ranks inside the borrowable
+    set and uses ``-E``.
+    """
+    do_short, rank_desc, rank_asc, valid_counts, held_long, held_short = _buffer_setup(
+        alpha_scores, cfg, short_scores
+    )
+    e = exp_ret.reindex(index=alpha_scores.index, columns=alpha_scores.columns).to_numpy()
+    c = cost_bps.reindex(index=alpha_scores.index, columns=alpha_scores.columns).to_numpy()
+    ic_ok = np.isfinite(e).any(axis=1)
+    d, mult = cfg.decile_pct, cfg.rebalance_buffer_mult
+
+    prev_long: list[int] = []
+    prev_short: list[int] = []
+    for t in range(len(alpha_scores.index)):
+        n = int(valid_counts[t])
+        if n == 0:
+            prev_long, prev_short = [], []
+            continue
+        k_enter, k_exit = _widths(n, d, mult)
+        prev_long = _swap_leg(rank_desc[t], prev_long, k_enter, k_exit,
+                              e[t], c[t], bool(ic_ok[t]), kappa)
+        held_long[t, prev_long] = 1
+        if do_short:
+            prev_short = _swap_leg(rank_asc[t], prev_short, k_enter, k_exit,
+                                   -e[t], c[t], bool(ic_ok[t]), kappa)
+            held_short[t, prev_short] = 1
+
+    return _to_masks(alpha_scores, held_long, held_short)
+
+
+# --------------------------------------------------------------------------- #
 # Dry-run verification
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -403,6 +495,75 @@ if __name__ == "__main__":
         np.allclose(r_m1.net_exposure.to_numpy(), 0.0, atol=1e-9)
     )
     checks["M1 end-to-end: book differs from baseline"] = bool(not r_m1.weights.equals(r_base.weights))
+    # ---- M2: swap only if it pays --------------------------------------- #
+    const_sigma = pd.DataFrame(0.02, index=bdates, columns=bnames)
+    ic_pos = pd.Series(0.05, index=bdates)
+    e_const = expected_return(balpha, const_sigma, ic_pos, horizon=5)
+    for style, ss in (("long_short", None), ("long_short_slb", sscores)):
+        base_l, base_s = apply_rebalance_buffer(balpha, _cfg(style), short_scores=ss)
+        k0_l, k0_s = apply_cost_swap_buffer(balpha, _cfg(style), het_cost, e_const,
+                                            short_scores=ss, kappa=0.0)
+        checks[f"M2 kappa=0, const sigma == baseline ({style})"] = bool(
+            k0_l.equals(base_l) and k0_s.equals(base_s)
+        )
+    e_nan = expected_return(balpha, const_sigma, pd.Series(np.nan, index=bdates), horizon=5)
+    nan_l, nan_s = apply_cost_swap_buffer(balpha, _cfg("long_short_slb"), het_cost, e_nan,
+                                          short_scores=sscores)
+    base_l, base_s = apply_rebalance_buffer(balpha, _cfg("long_short_slb"), short_scores=sscores)
+    checks["M2 no IC estimate == baseline"] = bool(nan_l.equals(base_l) and nan_s.equals(base_s))
+
+    het_sigma = pd.DataFrame(rng.uniform(0.01, 0.04, (nb, nn)), index=bdates, columns=bnames)
+    e_het = expected_return(balpha, het_sigma, ic_pos, horizon=5)
+    inf_l, inf_s = apply_cost_swap_buffer(balpha, _cfg("long_short_slb"), het_cost, e_het,
+                                          short_scores=sscores, kappa=np.inf)
+    # kappa=inf: on bars where k is unchanged, every incumbent still rankable is kept.
+    k_same = (k_enter_b == k_enter_b.shift(1)).to_numpy()
+    kept_all = True
+    for leg_mask, src in ((inf_l, balpha), (-inf_s, sscores)):
+        held = leg_mask.to_numpy() == 1
+        rankable = src.notna().to_numpy()
+        for t_ in range(1, nb):
+            if k_same[t_]:
+                must = held[t_ - 1] & rankable[t_]
+                kept_all &= bool((held[t_][must]).all())
+    checks["M2 kappa=inf keeps every rankable incumbent"] = kept_all
+    checks["M2 kappa=inf trades less than baseline"] = bool(
+        inf_l.diff().abs().sum().sum() < base_l.diff().abs().sum().sum()
+    )
+    m2_l, m2_s = apply_cost_swap_buffer(balpha, _cfg("long_short_slb"), het_cost, e_het,
+                                        short_scores=sscores)
+    checks["M2 long leg sized k_enter"] = bool((m2_l.sum(axis=1) == k_enter_b).all())
+    checks["M2 short leg only borrowable names"] = bool(
+        not ((m2_s < 0) & ~shortable).to_numpy().any()
+    )
+    checks["M2 kappa=1 changes the book"] = bool(not m2_l.equals(base_l))
+
+    # Hand-built pair: k_enter=2, k_exit=4. A (H00) and H04 swap values, so A drifts to
+    # rank 5 and H04 jumps to rank 1 — the one entrant, contesting A's slot (H01 stays).
+    # Gap in E is 10 bps: a 4-bps round trip swaps, a 16-bps one holds A.
+    pa = pd.DataFrame([np.arange(20, 0, -1.0), np.arange(20, 0, -1.0)], index=hd, columns=hn)
+    pa.iloc[1, [0, 4]] = pa.iloc[1, [4, 0]].to_numpy()            # A (H00) -> rank 5
+    pe = pd.DataFrame(0.0, index=hd, columns=hn)
+    pe.iloc[1, 0], pe.iloc[1, 4] = 0.0010, 0.0020                  # E_A 10 bps, E_in 20 bps
+    for cost_side, expect in ((2.0, "H04"), (8.0, "H00")):
+        pc = pd.DataFrame(cost_side, index=hd, columns=hn)
+        p_l, _ = apply_cost_swap_buffer(pa, _cfg("long_only"), pc, pe)
+        held1 = set(p_l.columns[p_l.iloc[1] == 1])
+        checks[f"M2 pair rule: round trip {2 * cost_side:.0f} bps -> holds {expect}"] = (
+            held1 == {"H01", expect}
+        )
+
+    config.ML_CONFIG.cost = replace(saved, charge_per_name=True, aum_rupees=1e7)
+    try:
+        r_m2 = run_execution(bwf, bpanic, bprice, _cfg("long_short_slb", "cost_swap"),
+                             terminal_returns=term, panels=bpanels)
+    finally:
+        config.ML_CONFIG.cost = saved
+    checks["M2 end-to-end: net NaN-free"] = bool(r_m2.net.notna().all())
+    checks["M2 end-to-end: dollar-neutral"] = bool(
+        np.allclose(r_m2.net_exposure.to_numpy(), 0.0, atol=1e-9)
+    )
+
     try:
         run_execution(bwf, bpanic, bprice, _cfg("long_only", "cost_band"), panels=bpanels)
         checks["M1 refuses to run without per-name costs"] = False
