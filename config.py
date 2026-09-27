@@ -479,6 +479,13 @@ class StrategyConfig:
                                         # Phase 3 kept them apart by writing separate
                                         # ledger FILES, which does not scale to a grid
                                         # that varies the target inside one ledger.
+    construction: str = "buffer"  # Phase 5 portfolio construction (docs/phase5_plan.md
+                                  # §7): "buffer" = the rank-only two-band buffer;
+                                  # "cost_band" = M1, per-name exit band scaled by
+                                  # cost^(1/3); "cost_swap" = M2, swap only if the
+                                  # expected gain beats the round-trip cost. Hashed
+                                  # into strategy_id only when not "buffer", so every
+                                  # pre-Phase-5 id is unchanged.
 
     @property
     def strategy_id(self) -> str:
@@ -500,6 +507,10 @@ class StrategyConfig:
             f"_HMM{self.hmm_states}"
             f"_{tgt_abbrev}"
         )
+        if self.construction != "buffer":
+            prefix += "_" + {"cost_band": "CB", "cost_swap": "CS"}.get(
+                self.construction, self.construction.upper()
+            )
 
         # All parameters included so every distinct permutation hashes uniquely
         param_string: str = (
@@ -508,6 +519,10 @@ class StrategyConfig:
             f"_{self.top_n}_{self.bottom_n}_{self.frequency}_{self.decile_pct}"
             f"_{self.rebalance_buffer_mult}_{self.target_col}"
         )
+        # Appended only off the default so the pre-Phase-5 hash (and every ledger column
+        # keyed on it) is reproduced bit-for-bit.
+        if self.construction != "buffer":
+            param_string += f"_{self.construction}"
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 
         return f"{prefix}_{param_hash}"

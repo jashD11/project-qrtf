@@ -68,6 +68,9 @@ _SLB_SUFFIX: Final[str] = "_slb"
 _VALID_STYLES: Final[frozenset[str]] = _BASE_STYLES | frozenset(
     {f"{s}{_SLB_SUFFIX}" for s in ("long_short", "dynamic_tilt")}
 )
+# Phase 5 portfolio constructions (StrategyConfig.construction). "buffer" is the
+# baseline path; the other two live in cost_aware.py (docs/phase5_plan.md §7).
+_CONSTRUCTIONS: Final[tuple[str, ...]] = ("buffer", "cost_band", "cost_swap")
 _DATE_LEVEL: Final[str] = "date"
 _TICKER_LEVEL: Final[str] = "ticker"
 
@@ -693,7 +696,31 @@ def run_execution(
     # No-trade hysteresis buffer (turnover control). mult<=1.0 keeps the raw
     # per-bar deciles (exact no-op); >1.0 makes decile membership sticky so
     # boundary jitter (rank k <-> k+1) stops forcing round-trips.
-    if cfg.rebalance_buffer_mult > 1.0:
+    # Phase 5 cost-aware constructions (docs/phase5_plan.md §7) replace the buffer
+    # with a cost-informed one; the default "buffer" never enters that branch.
+    construction: str = getattr(cfg, "construction", "buffer")
+    if construction not in _CONSTRUCTIONS:
+        raise ValueError(f"Unknown construction {construction!r}. Valid: {_CONSTRUCTIONS}")
+    if construction != "buffer":
+        if not (cost_cfg.apply_costs and cost_cfg.charge_per_name):
+            raise ValueError(
+                f"construction={construction!r} prices each trade from the per-name cost "
+                "panels — it needs ML_CONFIG.cost.charge_per_name=True (the Phase 4c regime)."
+            )
+        from src.production_ml import cost_aware
+
+        n_valid = alpha.notna().sum(axis=1)
+        k_per_bar = np.floor(n_valid * cfg.decile_pct).clip(lower=1)
+        decision_cost = cost_aware.decision_cost_bps(
+            panels, alpha.index, alpha.columns, k_per_bar, cost_cfg
+        )
+        if construction == "cost_band":
+            long_mask, short_mask = cost_aware.apply_cost_band_buffer(
+                alpha, cfg, decision_cost, short_scores=short_scores
+            )
+        else:
+            raise NotImplementedError(construction)
+    elif cfg.rebalance_buffer_mult > 1.0:
         long_mask, short_mask = apply_rebalance_buffer(alpha, cfg, short_scores=short_scores)
     else:
         long_mask = wf_result.long_mask

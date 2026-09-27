@@ -105,6 +105,7 @@ def make_ml_config(
     hmm_states: int = config.HEADLINE_HMM_STATES,
     rebalance_buffer_mult: float = 2.0,
     target_col: str = DEFAULT_TARGET,
+    construction: str = "buffer",
 ) -> StrategyConfig:
     """A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels."""
     return StrategyConfig(
@@ -117,6 +118,7 @@ def make_ml_config(
         decile_pct=decile_pct,
         rebalance_buffer_mult=rebalance_buffer_mult,
         target_col=target_col,
+        construction=construction,
     )
 
 
