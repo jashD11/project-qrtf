@@ -1,7 +1,10 @@
 # Phase 5 — selection gate and regime layer: falsification results, and the direction left
 
-**Status: two of three proposed ideas are falsified. This document records why, and redirects
-the phase at the one lever the tests did not touch.**
+**Status: closed. The trend overlay and short-leg gating were falsified up front (§2–§3); the
+redirect to cost-aware construction was pre-registered (§7), built, and run once (§9). No
+cell passes DSR 0.95 at N = 42 (best 0.272). M2 "swap only if it pays" lifts net Sharpe on
+every cell but cannot close the gap, so under the stop rule the cross-sectional alpha line
+closes.**
 
 Phase 4c closed as a negative result — all six frozen cells fail the DSR gate, best 0.017
 against a 0.95 threshold ([`phase4c_results.md`](phase4c_results.md)). Phase 5 was proposed
@@ -482,6 +485,121 @@ by 0.024 on one target and misses on the other. Any realisable gate, which will 
 a good share of months, captures only part of that ceiling. Short-leg gating is recorded as
 **not ruled out, with a ceiling too thin to justify building for** ahead of cost-aware
 construction; it stays deferred with the regime work.
+
+## 9 · The frozen run — result and verdict
+
+Run once, after the freeze commit (`9f8fbb3`), as
+`python run_pipeline_ml.py --phase5 --ledger data/trial_database/phase5/phase5_dsr_matrix.parquet`
+(cached fits, ~5 min). Ledger: 18 columns = the 6 Phase 4c `buffer` cells + the 12 new
+cells. DSR scored at **N = 42**, SR\* (annualised) = **1.17**.
+
+**In-run regression.** The six `buffer` columns reproduce `phase4c_dsr_matrix.parquet`, its
+gross twin and the execution-diagnostics rows **bit-for-bit**. Every difference below is
+the construction and nothing else.
+
+### 9.1 · Headline: **no cell passes.** Best DSR 0.272 against 0.95
+
+| target | style | construction | net SR | gross SR | turnover/bar | trade drag/yr | DSR (N=42) |
+|---|---|---|---|---|---|---|---|
+| 5b | `long_only` | buffer | 0.16 | 1.48 | 0.446 | 29.7% | 0.001 |
+| 5b | `long_only` | cost_band | 0.17 | 1.45 | 0.439 | 28.9% | 0.001 |
+| 5b | `long_only` | **cost_swap** | **0.81** | 1.27 | **0.155** | **10.4%** | 0.141 |
+| 5b | `long_short_slb` | buffer | −0.91 | 1.75 | 0.637 | 39.0% | 0.000 |
+| 5b | `long_short_slb` | cost_band | −0.89 | 1.76 | 0.643 | 38.8% | 0.000 |
+| 5b | `long_short_slb` | **cost_swap** | **0.48** | 1.55 | **0.224** | **13.7%** | 0.018 |
+| 5b | `dynamic_tilt_slb` | buffer | −0.05 | 1.89 | 0.717 | 47.1% | 0.000 |
+| 5b | `dynamic_tilt_slb` | cost_band | −0.02 | 1.85 | 0.714 | 46.3% | 0.000 |
+| 5b | `dynamic_tilt_slb` | **cost_swap** | **0.96** | 1.61 | **0.233** | **15.5%** | **0.272** |
+| 21b | `long_only` | buffer | 0.27 | 1.00 | 0.242 | 16.0% | 0.003 |
+| 21b | `long_only` | cost_band | 0.27 | 0.96 | 0.233 | 15.1% | 0.003 |
+| 21b | `long_only` | **cost_swap** | **0.59** | 0.96 | **0.132** | **8.5%** | 0.043 |
+| 21b | `long_short_slb` | buffer | −0.52 | 0.90 | 0.338 | 20.6% | 0.000 |
+| 21b | `long_short_slb` | cost_band | −0.52 | 0.89 | 0.333 | 19.9% | 0.000 |
+| 21b | `long_short_slb` | **cost_swap** | **0.12** | 0.98 | **0.194** | **11.4%** | 0.001 |
+| 21b | `dynamic_tilt_slb` | buffer | 0.19 | 1.18 | 0.370 | 24.1% | 0.002 |
+| 21b | `dynamic_tilt_slb` | cost_band | 0.19 | 1.13 | 0.360 | 23.0% | 0.002 |
+| 21b | `dynamic_tilt_slb` | **cost_swap** | **0.62** | 1.11 | **0.189** | **12.0%** | 0.052 |
+
+Sharpes are annualised and Lo-corrected, as in the gate. The `buffer` rows are the Phase 4c
+cells, and they are already counted in N.
+
+**Robustness of the "no pass".** It does not depend on any scoring choice:
+- N = 43 (charging 1 for the §2 trend overlay, per the Phase 3 §7.3 precedent) gives a best DSR of 0.267.
+- Deflating with the Sharpe spread of the 12 new columns only gives 0.268.
+- Against Phase 4c's own SR\* (0.976), the best net Sharpe (0.96) is still below the
+  benchmark, so its DSR is below 0.5 under every one of these definitions.
+
+### 9.2 · Secondary: the method-by-method effect, all 12 cells
+
+**M1 (`cost_band`) does nothing measurable.**
+- **Sharpe:** net Sharpe moves between −0.005 and +0.026.
+- **Turnover:** falls by at most 0.01.
+- **Why:** the cube root compresses the cost dispersion. A name at twice the median cost gets a band only 1.26× wider, and after the NSE-500 median fill the decision costs are tightly clustered (the effective one-way cost moves by ≈0.5 bps). The rule is sound, but at this cost dispersion there is almost nothing for it to act on. This is a null, reported as one.
+
+**M2 (`cost_swap`) is a large, uniform improvement.** It is positive in every cell:
+- **Net Sharpe:** +0.32 to +1.38.
+- **Turnover:** falls 43–68%.
+- **Trade drag:** roughly halves or better (e.g. 47.1% → 15.5%/yr on `dynamic_tilt_slb`/5b).
+- **Gross Sharpe:** drops 0.03–0.27 on 5 of the 6 M2 cells and rises 0.08 on `long_short_slb`/21b. Skipping marginal swaps holds some stale names, but the cost saved is worth 3–9× the gross edge given up.
+- **Every negative cell turns positive:** both `long_short_slb` cells and `dynamic_tilt_slb`/5b.
+
+Net Sharpe by calendar year shows the gain is broad, not one lucky stretch. In the three
+cells below, M2 beats the buffer in every one of the 10 years. 2025 is negative under every construction, which is
+the IC decay recorded in Phase 4c; M2 cannot trade around a signal that has stopped
+predicting.
+
+| year | DT 5b buffer | DT 5b M2 | LO 5b buffer | LO 5b M2 | LO 21b buffer | LO 21b M2 |
+|---|---|---|---|---|---|---|
+| 2016 | −1.16 | −0.09 | −0.61 | 0.15 | −0.40 | −0.36 |
+| 2017 | −0.68 | 2.09 | 0.26 | 2.29 | 1.59 | 2.65 |
+| 2018 | −1.66 | −0.87 | −1.47 | −1.00 | −1.31 | −0.99 |
+| 2019 | 0.49 | 2.23 | −0.19 | 1.10 | −0.49 | 0.11 |
+| 2020 | 2.31 | 2.82 | 3.11 | 3.30 | 3.10 | 3.14 |
+| 2021 | 0.54 | 2.44 | 0.89 | 2.09 | 1.29 | 1.77 |
+| 2022 | −0.83 | 0.33 | −0.47 | 0.02 | −0.52 | 0.10 |
+| 2023 | 2.16 | 3.33 | 2.39 | 3.32 | 2.17 | 2.52 |
+| 2024 | 0.37 | 0.71 | 0.38 | 0.63 | 0.10 | 0.22 |
+| 2025 | −2.09 | −1.33 | −2.27 | −2.06 | −2.81 | −2.20 |
+
+(Plain annualised Sharpe of daily net returns, without the Lo correction. It is a read-only
+diagnostic that selects nothing.)
+
+### 9.3 · Why it still fails, in one line of arithmetic
+
+With ~9.3 years of daily data, a net Sharpe near 1 has a standard error of roughly 0.37, so
+passing DSR 0.95 against SR\* 1.17 needs a net Sharpe of about **1.8**.
+- The best **gross** Sharpe in the grid is 1.89, the `dynamic_tilt_slb`/5b buffer cell before any cost.
+- M2 took that cell's net from −0.05 to 0.96, closing about half the gross-to-net gap.
+- The other half is costs that a book this signal can justify holding still has to pay.
+
+This is the §7.1 ceiling made concrete. At zero cost only the 5b cells cleared the bar, and
+only just. A method that recovers half the drag cannot get there, and none can recover all of it.
+
+### 9.4 · Verdict under the pre-registered stop rule
+
+**No cell passes. Under §7.5 the cross-sectional alpha line closes for this program.** κ,
+the band exponent and the construction family are not revisited. M2's improvement is the
+kind of result that invites "one more variant" (a κ below 1, an IC-weighted κ, M1+M2
+combined), and every one of those would be search on the same data, charged in N and
+arriving at a higher SR\*.
+
+What Phase 5 established, for the record:
+
+1. **Cost-aware construction works as economics.** Pricing the round trip into the swap
+   decision recovers ~half the trade drag and 0.3–1.4 of net Sharpe on every cell. This is the
+   right construction for any future signal on this cost stack, and it should be the
+   default starting point for one.
+2. **It is not enough for *this* signal.** IC ≈ 0.04, decaying to ≈0 by 2025, cannot clear
+   DSR 0.95 at N = 42 under realistic NSE costs by any construction. The zero-cost ceiling
+   already said so, and the frozen run confirms it.
+3. **Width-of-band construction (M1) is a null** at this cost dispersion.
+4. **Short-leg gating is not closed but not worth building** (§8.3). **Trend tilting is
+   falsified** (§2). **The regime layer is decorative** until Tier 3 consumes something other
+   than `panic` (§1.1).
+
+A future phase would need a **new signal source**, for example the delivery / fundamental features
+excluded since Phase 2, not a new way to trade this one. It would start with its own frozen
+prior and N ≥ 42.
 
 ---
 
