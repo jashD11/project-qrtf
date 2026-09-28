@@ -278,6 +278,7 @@ def _record_diagnostics(cfg: StrategyConfig, result) -> None:
     row = dict(
         strategy_id=cfg.strategy_id, frequency=cfg.frequency,
         execution_style=cfg.execution_style, target=cfg.target_col,
+        **({"construction": cfg.construction} if cfg.construction != "buffer" else {}),
         cum_net=float((1 + result.net).prod() - 1),
         cum_gross=float((1 + result.gross.dropna()).prod() - 1),
         sharpe_net=_cum_sharpe(result.net)[1],
@@ -320,29 +321,35 @@ def _persist_ic(wf: WalkForwardResult, frequency: str, target_col: str = "") -> 
 # --------------------------------------------------------------------------- #
 def build_headline_grid(
     frequencies: list[str], styles: list[str], targets: list[str],
+    constructions: list[str] | None = None,
 ) -> list[StrategyConfig]:
     """The explicit Cartesian product of the committed [SWEEP] axes."""
+    constructions = constructions or ["buffer"]
     return [
-        make_ml_config(freq, style, target_col=target)
-        for freq, style, target in itertools.product(frequencies, styles, targets)
+        make_ml_config(freq, style, target_col=target, construction=construction)
+        for freq, style, target, construction in itertools.product(
+            frequencies, styles, targets, constructions
+        )
     ]
 
 
 def run_headline_grid(
     frequencies: list[str], styles: list[str], skip_dsr: bool = False,
-    targets: list[str] | None = None,
+    targets: list[str] | None = None, constructions: list[str] | None = None,
 ) -> None:
     targets = targets or [DEFAULT_TARGET]
-    configs = build_headline_grid(frequencies, styles, targets)
+    constructions = constructions or ["buffer"]
+    configs = build_headline_grid(frequencies, styles, targets, constructions)
 
     print(DIVIDER)
     print(f"  PRODUCTION_ML HEADLINE SWEEP — {len(configs)} cells "
-          f"({len(frequencies)} freq x {len(styles)} styles x {len(targets)} targets, "
+          f"({len(frequencies)} freq x {len(styles)} styles x {len(targets)} targets"
+          f"{f' x {len(constructions)} constructions' if len(constructions) > 1 else ''}, "
           f"hmm_states={config.HEADLINE_HMM_STATES} frozen)")
     print(DIVIDER)
     for cfg in configs:
         print(f"  {cfg.strategy_id}  ->  freq={cfg.frequency}  style={cfg.execution_style}"
-              f"  target={cfg.target_col}")
+              f"  target={cfg.target_col}  construction={cfg.construction}")
     _print_cost_regime()
 
     # Tier 2 once for the whole run (regime is daily, frequency-independent).
@@ -365,9 +372,13 @@ def run_headline_grid(
         _persist_ic(wf, frequency, target_col)
         terminal = load_terminal_returns(frequency)
 
-        for style in styles:
-            cfg = make_ml_config(frequency, style, target_col=target_col)
-            print(f"\n[Tier 3] {frequency} | {style} | {target_col}")
+        # Construction is an execution-time axis like style: it fans out over the
+        # same fit, so the Phase 5 grid costs no extra Tier 1 work.
+        for style, construction in itertools.product(styles, constructions):
+            cfg = make_ml_config(
+                frequency, style, target_col=target_col, construction=construction
+            )
+            print(f"\n[Tier 3] {frequency} | {style} | {target_col} | {construction}")
             result = run_execution(
                 wf, panic, price_wide, cfg, terminal_returns=terminal, panels=panels,
             )
@@ -388,7 +399,7 @@ def run_headline_grid(
             )
             _record_diagnostics(cfg, result)
 
-    _summarize(configs, PRODUCTION_LEDGER, frequencies, styles, targets)
+    _summarize(configs, PRODUCTION_LEDGER, frequencies, styles, targets, constructions)
 
     # Tier 4 — the credibility gate: deflate each Sharpe for the full grid's
     # multiple-testing count (N = every cell searched, not just what's written).
@@ -512,12 +523,14 @@ def _cum_sharpe(returns: pd.Series) -> tuple[float, float]:
 def _summarize(
     configs: list[StrategyConfig], ledger_path: str,
     frequencies: list[str], styles: list[str], targets: list[str] | None = None,
+    constructions: list[str] | None = None,
 ) -> None:
     targets = targets or [DEFAULT_TARGET]
+    constructions = constructions or ["buffer"]
     ledger = pd.read_parquet(ledger_path)
     # Map each cell's metrics via the in-memory configs (NOT by parsing the id).
     metrics = {
-        (cfg.frequency, cfg.execution_style, cfg.target_col): _cum_sharpe(
+        (cfg.frequency, cfg.execution_style, cfg.target_col, cfg.construction): _cum_sharpe(
             ledger[cfg.strategy_id]
         )
         for cfg in configs if cfg.strategy_id in ledger.columns
@@ -525,13 +538,14 @@ def _summarize(
 
     print(f"\n{DIVIDER}\n  HEADLINE SWEEP COMPLETE — {ledger.shape[1]} ledger column(s)\n{DIVIDER}")
     print("\n  Per-cell: CumRet / Sharpe")
-    for target in targets:
-        print(f"\n  target={target}")
+    for target, construction in itertools.product(targets, constructions):
+        print(f"\n  target={target}"
+              + (f"  construction={construction}" if len(constructions) > 1 else ""))
         print(f"  {'freq':<14}" + "".join(f"{s:>22}" for s in styles))
         for freq in frequencies:
             cells = []
             for style in styles:
-                cum, sh = metrics.get((freq, style, target), (0.0, 0.0))
+                cum, sh = metrics.get((freq, style, target, construction), (0.0, 0.0))
                 cells.append(f"{cum:>+11.2%}/{sh:>6.2f}")
             print(f"  {freq:<14}" + "".join(f"{c:>22}" for c in cells))
 
@@ -550,6 +564,8 @@ def _summarize(
     _band("execution_style", lambda k: k[1])
     if len(targets) > 1:
         _band("target", lambda k: k[2])
+    if len(constructions) > 1:
+        _band("construction", lambda k: k[3])
 
     print("\n  NOTE: hmm_states is not swept — the panic gate is n_states-invariant,")
     print("        so a 2- vs 3-state grid would be return-identical today. Wiring")
@@ -602,6 +618,27 @@ def apply_phase4c_regime(args) -> tuple[list[str], list[str], list[str]]:
     return frequencies, styles, targets
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5 frozen grid (docs/phase5_plan.md §7)
+# --------------------------------------------------------------------------- #
+def apply_phase5_regime(args) -> tuple[list[str], list[str], list[str], list[str]]:
+    """
+    Switch the run into the Phase 5 frozen grid: the Phase 4c grid and cost regime,
+    crossed with every construction in ``config.PHASE5_RUN_CONSTRUCTIONS``.
+
+    The six ``buffer`` cells are the Phase 4c cells re-run into the same ledger, an
+    in-run regression check (they must match ``phase4c_dsr_matrix.parquet`` exactly).
+    They are already counted in N; only the 12 ``cost_band``/``cost_swap`` cells are
+    new, which is what ``config.TRIAL_LEDGER`` charges.
+    """
+    if args.ledger == DEFAULT_PRODUCTION_LEDGER:
+        args.ledger = config.PHASE5_LEDGER
+    frequencies, styles, targets = apply_phase4c_regime(args)
+    print("  PHASE 5 — constructions: " + ", ".join(config.PHASE5_RUN_CONSTRUCTIONS))
+    print(f"  N = {config.TRIALS_SEARCHED} (config.TRIAL_LEDGER)")
+    return frequencies, styles, targets, list(config.PHASE5_RUN_CONSTRUCTIONS)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PRODUCTION_ML sweep orchestrator")
     parser.add_argument(
@@ -643,6 +680,12 @@ def main() -> None:
              "SLB-restricted short leg and tiered borrow all ON",
     )
     parser.add_argument(
+        "--phase5", action="store_true",
+        help="run the Phase 5 frozen grid (docs/phase5_plan.md §7): the Phase 4c "
+             "grid and cost regime x {buffer, cost_band, cost_swap}. The buffer "
+             "cells must reproduce Phase 4c bit-for-bit",
+    )
+    parser.add_argument(
         "--skip-dsr", action="store_true",
         help="skip the auto-DSR gate at the end of the grid (for per-frequency "
              "partial runs, whose len(configs) is the wrong N); run `--dsr` "
@@ -652,9 +695,14 @@ def main() -> None:
 
     global PRODUCTION_LEDGER, GROSS_LEDGER, EXEC_DIAGNOSTICS_PATH
     frequencies, styles, targets = args.frequencies, args.styles, args.target
+    constructions = ["buffer"]
 
+    if args.phase4c and args.phase5:
+        parser.error("--phase4c and --phase5 are separate frozen grids; pick one")
     if args.phase4c:
         frequencies, styles, targets = apply_phase4c_regime(args)
+    elif args.phase5:
+        frequencies, styles, targets, constructions = apply_phase5_regime(args)
 
     PRODUCTION_LEDGER = args.ledger
     GROSS_LEDGER = args.ledger.replace(".parquet", "_gross.parquet")
@@ -667,6 +715,7 @@ def main() -> None:
     else:
         run_headline_grid(
             frequencies, styles, skip_dsr=args.skip_dsr, targets=targets,
+            constructions=constructions,
         )
 
 
