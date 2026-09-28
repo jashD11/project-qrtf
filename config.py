@@ -285,8 +285,16 @@ TRIAL_LEDGER: list[tuple[str, int, str]] = [
     ("phase3 §7.3 multi-scale panic gate", 1, "tested and rejected — still a search"),
     ("phase4b headline, daily_nse500 x 3 styles", 3, ""),
     ("phase4c frozen grid, 3 styles x 2 targets", 6, "docs/phase4c_plan.md §5"),
+    ("phase5 §2 trend overlay (read-only kill-test)", 0,
+     "0 as pre-registered (phase5 §7.5); the phase3 §7.3 precedent would charge 1 — "
+     "phase5 §9 reports the verdict at N=43 too"),
+    ("phase5 §8.1 zero-cost ceiling", 0, "the phase4c cells re-scored gross"),
+    ("phase5 §8.2 swap attribution", 0, "read-only on already-searched cells"),
+    ("phase5 §8.3 perfect-foresight short leg", 0,
+     "infeasible by construction — a ceiling, not a strategy"),
+    ("phase5 cost-aware, 2 methods x 3 styles x 2 targets", 12, "docs/phase5_plan.md §7"),
 ]
-TRIALS_SEARCHED: int = sum(n for _, n, _ in TRIAL_LEDGER)   # = 30
+TRIALS_SEARCHED: int = sum(n for _, n, _ in TRIAL_LEDGER)   # = 42
 
 
 @dataclass
@@ -441,10 +449,14 @@ PHASE4C_COST_OVERRIDES: dict[str, object] = {
 # Phase 5 — cost-aware construction, pre-registered (docs/phase5_plan.md §7).
 #
 # Frozen from theory before any result exists; none of these is tuned on returns.
-# The grid (Phase 4c grid x PHASE5_CONSTRUCTIONS) enters TRIAL_LEDGER at the freeze.
+# The grid (Phase 4c grid x PHASE5_CONSTRUCTIONS) is on TRIAL_LEDGER (N 30 -> 42).
+# `--phase5` also re-runs the six "buffer" cells into the same ledger as an in-run
+# regression check; they are the Phase 4c cells, already counted, and must match
+# phase4c_dsr_matrix.parquet bit-for-bit.
 # --------------------------------------------------------------------------- #
 PHASE5_CONSTRUCTIONS: list[str] = ["cost_band", "cost_swap"]
 PHASE5_LEDGER: str = "data/trial_database/phase5_dsr_matrix.parquet"
+PHASE5_RUN_CONSTRUCTIONS: list[str] = ["buffer"] + PHASE5_CONSTRUCTIONS
 PHASE5_BAND_EXPONENT: float = 1.0 / 3.0   # M1: exit band ∝ cost^(1/3) — small-cost
                                           # no-trade asymptotics (Rogers 2004)
 PHASE5_SWAP_KAPPA: float = 1.0            # M2: swap iff expected gain > 1.0 x round-trip cost

@@ -434,7 +434,7 @@ if __name__ == "__main__":
             np.isfinite(on["AC_factor"]).all()
         ),
         "honest N is larger than a phase's column count": bool(
-            config.TRIALS_SEARCHED == 30 and config.ML_CONFIG.dsr.trials_override == 30
+            config.TRIALS_SEARCHED == 42 and config.ML_CONFIG.dsr.trials_override == 42
         ),
     }
     print("-" * 96)
