@@ -106,8 +106,16 @@ def make_ml_config(
     rebalance_buffer_mult: float = 2.0,
     target_col: str = DEFAULT_TARGET,
     construction: str = "buffer",
+    purge_label_overlap: bool | None = None,
 ) -> StrategyConfig:
-    """A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels."""
+    """
+    A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels.
+
+    ``purge_label_overlap`` defaults to the run-wide ``config.ML_CONFIG`` switch, so the
+    configs a run materialises always describe the fit ``compute_signals`` performs.
+    """
+    if purge_label_overlap is None:
+        purge_label_overlap = config.ML_CONFIG.purge_label_overlap
     return StrategyConfig(
         is_simulation=False,
         market_type=_LIVE_MARKET,
@@ -119,6 +127,7 @@ def make_ml_config(
         rebalance_buffer_mult=rebalance_buffer_mult,
         target_col=target_col,
         construction=construction,
+        purge_label_overlap=purge_label_overlap,
     )
 
 
@@ -204,7 +213,8 @@ def compute_signals(
     del bars
     gc.collect()
     engine = TreeAlphaEngine.from_frequency(
-        frequency, target_col=target_col, decile_pct=decile_pct
+        frequency, target_col=target_col, decile_pct=decile_pct,
+        purge_label_overlap=config.ML_CONFIG.purge_label_overlap,
     )
     # E1: served from disk when this exact fit has been computed before. The fit is a
     # pure function of (features, engine knobs), so the cache is transparent — see
@@ -245,6 +255,7 @@ def _print_cost_regime() -> None:
     """
     c = config.ML_CONFIG.cost
     print(f"\n{DIVIDER}\n  COST REGIME\n{DIVIDER}")
+    print(f"  tier1 label-overlap purge  : {config.ML_CONFIG.purge_label_overlap}")
     print(f"  statutory one-way          : {c.compose_oneway_bps():.4f} bps")
     print(f"  apply_costs                : {c.apply_costs}")
     print(f"  per-name spread + impact   : {c.charge_per_name}"
@@ -307,6 +318,8 @@ def _persist_ic(wf: WalkForwardResult, frequency: str, target_col: str = "") -> 
     if wf.ic_diagnostics is None:
         return
     tag = f"{frequency}_{target_col.rsplit('_', 1)[-1]}" if target_col else frequency
+    if config.ML_CONFIG.purge_label_overlap:
+        tag += "_purge"   # never overwrite the unpurged artifact earlier phases cite
     path = DIAGNOSTICS_PATH_TMPL.format(frequency=tag)
     with open(path, "w") as fh:
         fh.write("# READ-ONLY fit diagnostic (cross-sectional rank IC). Do NOT use to\n")
@@ -691,7 +704,15 @@ def main() -> None:
              "partial runs, whose len(configs) is the wrong N); run `--dsr` "
              "separately once the full grid is banked",
     )
+    parser.add_argument(
+        "--purge-label-overlap", action="store_true",
+        help="Phase 6 Tier 1 fix: drop the last h training bars, whose h-bar labels "
+             "reach into the scored block. Changes every strategy_id (tag _PG) and the "
+             "walk-forward cache key; off reproduces every earlier ledger bit-for-bit",
+    )
     args = parser.parse_args()
+    if args.purge_label_overlap:
+        config.ML_CONFIG.purge_label_overlap = True
 
     global PRODUCTION_LEDGER, GROSS_LEDGER, EXEC_DIAGNOSTICS_PATH
     frequencies, styles, targets = args.frequencies, args.styles, args.target

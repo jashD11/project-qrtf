@@ -386,6 +386,10 @@ class _MLConfig:
     cost: _NSECostConfig = field(default_factory=_NSECostConfig)
     dsr: _DSRConfig = field(default_factory=_DSRConfig)
     phase4: _Phase4Config = field(default_factory=_Phase4Config)
+    # Phase 6: purge the last h training bars, whose h-bar labels reach into the scored
+    # block (tier1_trees.purge_label_overlap). Off by default so every earlier ledger
+    # reproduces bit-for-bit; `run_pipeline_ml.py --purge-label-overlap` turns it on.
+    purge_label_overlap: bool = False
 
 
 ML_CONFIG: _MLConfig = _MLConfig()
@@ -501,6 +505,10 @@ class StrategyConfig:
                                   # expected gain beats the round-trip cost. Hashed
                                   # into strategy_id only when not "buffer", so every
                                   # pre-Phase-5 id is unchanged.
+    purge_label_overlap: bool = False  # Phase 6 Tier 1 fix (docs/phase6_plan.md §A.7):
+                                  # fitted without the h training bars whose labels
+                                  # reach into the scored block. A different fit, so
+                                  # a different id — hashed (tag _PG) only when on.
 
     @property
     def strategy_id(self) -> str:
@@ -526,6 +534,8 @@ class StrategyConfig:
             prefix += "_" + {"cost_band": "CB", "cost_swap": "CS"}.get(
                 self.construction, self.construction.upper()
             )
+        if self.purge_label_overlap:
+            prefix += "_PG"
 
         # All parameters included so every distinct permutation hashes uniquely
         param_string: str = (
@@ -538,6 +548,8 @@ class StrategyConfig:
         # keyed on it) is reproduced bit-for-bit.
         if self.construction != "buffer":
             param_string += f"_{self.construction}"
+        if self.purge_label_overlap:
+            param_string += "_purge"
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 
         return f"{prefix}_{param_hash}"

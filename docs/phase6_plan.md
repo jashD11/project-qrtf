@@ -157,6 +157,58 @@ If either anchor fails, Part A stops and the discrepancy is the first thing inve
   conditioning or a universe filter, counts as **in-sample for 2021–2025**. It carries its own
   N and is judged on the sealed post-2025-06-30 holdout, not only on the existing window.
 
+### A.7 · Found during Part A: a Tier 1 training-label leak (fixed opt-in)
+
+Added 2026-10-07. This is not part of the pre-registration. It is a defect found while
+answering a question about the walk-forward.
+
+**The leak.**
+- `TreeAlphaEngine.run_walk_forward` trains on every row of the 504-day block.
+- A row on bar d carries the h-bar label log(close[d+h] / close[d]).
+- For the last h rows of the block, d+h falls inside the scored block that follows, so the
+  model was fitted on returns it was then tested on.
+- That affects h of 504 rows: under 1% at 5b and about 4% at 21b.
+- It can only flatter a result.
+- `scripts/no_lookahead_check.py` perturbs Tier 3 inputs only, so it never saw this.
+
+**The fix** (`src/production_ml/tier1_trees.py`):
+- `purge_label_overlap()` drops the last h bars of each training block. h is read from the
+  target name by `target_horizon()`.
+- Every training label left is then realised by the block's last bar.
+- The fix is opt-in: `TreeAlphaEngine(purge_label_overlap=True)`, or
+  `run_pipeline_ml.py --purge-label-overlap`, which sets `config.ML_CONFIG.purge_label_overlap`.
+- When on, it adds:
+  - a `_PG` tag and hash term to `strategy_id`;
+  - a `purge` part to the wf_cache key;
+  - its own `tree_fit_diagnostics_*_purge.csv`, so the unpurged files earlier phases cite are
+    never overwritten.
+
+**Verification.**
+- The tier1 dry-run gained seven purge checks. They include a canary that records every
+  fold's training rows: unpurged, a label must reach the scored block; purged, none may and
+  none more than necessary are dropped.
+- The wf_cache dry-run checks that the purge gives a new key.
+- With the flag off, the Phase 5 grid was re-run (`data/trial_database/regression/phase6_purge_off*`).
+  `scripts/regression_check.py` reports **4/4 pairs bit-identical** against
+  `data/trial_database/phase5/phase5_dsr_matrix*`, and every existing `tree_fit_diagnostics_*.csv`
+  is unchanged.
+
+**Size** (`lgbm` only, daily_nse500, `data/trial_database/phase6/purge/lgbm_quick_check.csv`):
+
+| target | full IC leaky → purged | 2016–20 | 2021–25 H1 | mean daily rank-corr (leaky vs purged alpha) |
+|---|---|---|---|---|
+| 5b | 0.0501 → 0.0488 (−3%) | 0.0700 → 0.0677 | 0.0281 → 0.0280 | 0.91 |
+| 21b | 0.0400 → 0.0347 (−13%) | 0.0690 → 0.0590 | 0.0075 → 0.0074 | 0.89 |
+
+**Consequences.**
+- No verdict changes: Phase 4c and Phase 5 failed already, and the fix only lowers the
+  numbers.
+- The 21b cells were overstated more than the 5b cells.
+- Part A's 5b conclusions stand: late IC is unchanged, and early IC falls slightly.
+- The purged ensemble re-score of the Phase 5 grid was started and then paused. It is not
+  run, and it becomes the F0 baseline of Part B.
+- From Phase 6 onwards every fit runs with the purge on.
+
 ---
 
 ## B · Find a better signal

@@ -109,6 +109,9 @@ def cache_key(engine: TreeAlphaEngine, features: pd.DataFrame, frequency: str) -
         engine.model_choice,
         panel_digest(features, read_cols),
     )
+    # Appended only when on, so every pre-Phase-6 key (and its cache entry) is unchanged.
+    if getattr(engine, "purge_label_overlap", False):
+        parts += ("purge",)
     return "__".join(parts)
 
 
@@ -262,6 +265,10 @@ if __name__ == "__main__":
         )
         checks["different decile_pct -> new key"] = (
             cache_key(TreeAlphaEngine(decile_pct=0.05, model_choice="lgbm"),
+                      dummy, "daily") != base_key
+        )
+        checks["label-overlap purge -> new key"] = (
+            cache_key(TreeAlphaEngine(model_choice="lgbm", purge_label_overlap=True),
                       dummy, "daily") != base_key
         )
         checks["identical inputs -> same key"] = (

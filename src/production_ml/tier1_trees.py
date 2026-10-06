@@ -27,6 +27,7 @@ The engine emits three aligned wide DataFrames (index = date, columns = ticker):
 
 import gc
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Final
@@ -84,6 +85,40 @@ _SEED: Final[int] = 42
 
 # --- Fit diagnostic: min cross-section for a day's IC to be well-defined ---- #
 _IC_MIN_NAMES: Final[int] = 5
+
+
+# --------------------------------------------------------------------------- #
+# Label-overlap purge (Phase 6)
+# --------------------------------------------------------------------------- #
+# A training row on bar d carries the h-bar label close[d+h] / close[d]. For the last
+# h bars of a training block, d+h falls INSIDE the scored block that follows, so
+# the model is fitted on returns it is about to be tested on. The leak is small (h of
+# 504 days: <1% of rows at 5b, ~4% at 21b) and can only flatter the result, but it
+# breaks the zero-look-ahead invariant. Purging the last h bars leaves only labels
+# fully realised by the block's final bar. It is opt-in so every pre-Phase-6 fit and
+# ledger reproduces bit-for-bit; see docs/phase6_plan.md §A.7.
+def target_horizon(target_col: str) -> int:
+    """'tgt_fwd_logret_5b' -> 5: the bar count the label looks forward."""
+    m = re.fullmatch(r".*_(\d+)b", target_col)
+    if m is None:
+        raise ValueError(f"cannot read a horizon from target_col={target_col!r}")
+    return int(m.group(1))
+
+
+def purge_label_overlap(train_block: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """
+    Drop the training rows whose label is not yet realised at the block's last bar.
+
+    Counted in **bars** (unique timestamps), the unit the label is defined in, so
+    the same rule is right on daily and intraday panels.
+    """
+    if train_block.empty or horizon <= 0:
+        return train_block
+    stamps = train_block.index.get_level_values(DATE_LEVEL)
+    uniq = np.unique(stamps.to_numpy())
+    if len(uniq) <= horizon:
+        return train_block.iloc[0:0]
+    return train_block[stamps < uniq[-horizon]]
 
 
 @dataclass
@@ -203,6 +238,7 @@ class TreeAlphaEngine:
         train_window: int = TRAIN_WINDOW,
         predict_window: int = PREDICT_WINDOW,
         decile_pct: float = DECILE_PCT,
+        purge_label_overlap: bool = False,
     ) -> None:
         if target_col not in TARGET_COLUMNS:
             raise ValueError(
@@ -220,6 +256,9 @@ class TreeAlphaEngine:
         self.train_window: int = train_window
         self.predict_window: int = predict_window
         self.decile_pct: float = decile_pct
+        # Validated here so a malformed target fails at construction, not mid-run.
+        self.horizon: int = target_horizon(target_col)
+        self.purge_label_overlap: bool = purge_label_overlap
         # Feature schema is resolved from the input frame at run time (17 vs 19),
         # so a price-only intraday panel and a full daily panel both work.
         self.feature_cols: list[str] = list(FEATURE_COLUMNS)
@@ -231,6 +270,7 @@ class TreeAlphaEngine:
         target_col: str = DEFAULT_TARGET,
         model_choice: str = "ensemble",
         decile_pct: float = DECILE_PCT,
+        purge_label_overlap: bool = False,
     ) -> "TreeAlphaEngine":
         """
         Build an engine whose walk-forward windows come from ``FREQ_REGISTRY``.
@@ -245,6 +285,7 @@ class TreeAlphaEngine:
             train_window=spec.train_days,
             predict_window=spec.predict_days,
             decile_pct=decile_pct,
+            purge_label_overlap=purge_label_overlap,
         )
 
     # ---------------------------------------------------------------------- #
@@ -392,6 +433,8 @@ class TreeAlphaEngine:
             train_block: pd.DataFrame = _slice(
                 unique_days[train_lo], unique_days[start - 1]
             )
+            if self.purge_label_overlap:
+                train_block = purge_label_overlap(train_block, self.horizon)
             test_hi: int = min(start + self.predict_window, n_dates) - 1
             test_block: pd.DataFrame = _slice(unique_days[start], unique_days[test_hi])
 
@@ -423,7 +466,8 @@ class TreeAlphaEngine:
 
         print(
             f"[tier1_trees] Walk-forward done | model={self.model_choice} | "
-            f"target={self.target_col} | folds={n_folds} | "
+            f"target={self.target_col} | purge={self.purge_label_overlap} | "
+            f"folds={n_folds} | "
             f"OOS days={alpha_scores.shape[0]} | universe={alpha_scores.shape[1]}"
         )
         _print_ic_panel(ic_diagnostics)
@@ -620,3 +664,54 @@ if __name__ == "__main__":
         print(f"  {name:<44}: {'PASS' if ok else 'FAIL'}")
     print("=" * 70)
     assert all(ic_checks.values()), "tier1_trees IC diagnostic FAILED"
+
+    # --- Label-overlap purge (Phase 6) ------------------------------------- #
+    # The purge must remove exactly h bars, leave only labels realised inside the
+    # training block, and be a no-op when off. The CANARY runs the real walk-forward
+    # with every fold's training rows recorded: unpurged, some training label must be
+    # caught reaching into the scored block (else the check cannot see the leak);
+    # purged, none may.
+    print()
+    print("=" * 70)
+    print("Label-overlap purge")
+    print("=" * 70)
+    h = 5
+    all_days = dummy.index.get_level_values(DATE_LEVEL).unique()
+    block = dummy.loc[dummy.index.get_level_values(DATE_LEVEL) < all_days[504]]
+    purged = purge_label_overlap(block, h)
+    kept_last = purged.index.get_level_values(DATE_LEVEL).max()
+    purge_checks: dict[str, bool] = {
+        "drops exactly h bars x tickers":
+            len(block) - len(purged) == h * N_TICKERS,
+        "every kept label is realised in-block":
+            all_days.get_loc(kept_last) + h <= 503,
+        "horizon parsed from the target name":
+            target_horizon("tgt_fwd_logret_21b") == 21,
+        "engine reads the horizon of its target":
+            TreeAlphaEngine(target_col="tgt_fwd_logret_5b").horizon == 5,
+    }
+
+    class _Recorder(TreeAlphaEngine):
+        """Records, per fold, how far the latest training label reaches."""
+        def _fit_predict_block(self, train_df, test_df):
+            day = pd.Series(np.arange(len(all_days)), index=all_days)
+            last_label_end = int(day[train_df.index.get_level_values(DATE_LEVEL).max()]) + h
+            test_start = int(day[test_df.index.get_level_values(DATE_LEVEL).min()])
+            self.reach.append(last_label_end - test_start)   # >= 0 means a leak
+            return super()._fit_predict_block(train_df, test_df)
+
+    reach = {}
+    for purge in (False, True):
+        rec = _Recorder(target_col="tgt_fwd_logret_5b", model_choice="lgbm",
+                        purge_label_overlap=purge)
+        rec.reach = []
+        rec.run_walk_forward(dummy)
+        reach[purge] = rec.reach
+    purge_checks["canary: unpurged, a label reaches the scored block"] = (
+        max(reach[False]) >= 0)
+    purge_checks["purged: no label reaches the scored block"] = max(reach[True]) < 0
+    purge_checks["purged: drops nothing more than needed"] = max(reach[True]) == -1
+    for name, ok in purge_checks.items():
+        print(f"  {name:<52}: {'PASS' if ok else 'FAIL'}")
+    print("=" * 70)
+    assert all(purge_checks.values()), "tier1_trees purge check FAILED"
