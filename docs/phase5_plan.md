@@ -488,7 +488,7 @@ construction; it stays deferred with the regime work.
 
 ## 9 · The frozen run — result and verdict
 
-Run once, after the freeze commit (`9f8fbb3`), as
+Run once, after the freeze commit (`738f8c9`), as
 `python run_pipeline_ml.py --phase5 --ledger data/trial_database/phase5/phase5_dsr_matrix.parquet`
 (cached fits, ~5 min). Ledger: 18 columns = the 6 Phase 4c `buffer` cells + the 12 new
 cells. DSR scored at **N = 42**, SR\* (annualised) = **1.17**.
