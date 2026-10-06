@@ -1,5 +1,24 @@
-pandas
-numpy
-hmmlearn
-pyarrow
-scipy
+# Python 3.12 (developed and run on 3.12.4).
+#
+# Pinned to the environment as of 2026-09-27 so a fresh clone installs
+# deterministically. CAVEAT: the committed ledgers under data/ were produced on an
+# earlier environment whose exact package versions were not recorded, so these pins
+# make future runs reproducible against each other — they are not a claim that they
+# are the versions that generated the published numbers.
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.1
+pyarrow==14.0.2
+
+# models
+scikit-learn==1.4.2
+lightgbm==4.6.0
+xgboost==3.3.0
+hmmlearn==0.3.3
+
+# data acquisition only — not needed to run the engine on an existing panel.
+# jugaad-data is imported lazily by src/production_ml/data_scraping.py, so every
+# result path works without it installed.
+jugaad-data>=0.28
+gdown==6.1.0
+requests==2.32.2

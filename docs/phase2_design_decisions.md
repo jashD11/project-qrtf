@@ -1,0 +1,202 @@
+# Phase 2 Design Decisions
+
+Living record of design decisions for the `PRODUCTION_ML` (live-data, tree-based)
+pipeline. Status tags:
+- **[DECIDED]** — settled, safe to build against.
+- **[RECOMMENDED]** — proposed default, not yet explicitly confirmed.
+- **[OPEN]** — genuine fork still to resolve.
+
+---
+
+## 1. Data acquisition & universe
+
+**Data facts (from the shared Drive folder "15m_dataset"):**
+- 86 NSE files = **68 stocks + 18 indices**. Each also has a `.BSE` twin (176 total).
+- Per file: 15-minute bars, **2015 → 2025 (~10 yr)**, ~62k rows, ~3.7 MB.
+- Schema: `timestamp, open, high, low, close, volume, oi`. `timestamp` is IST
+  tz-aware (`+05:30`), session 09:15–15:30 = 25 bars/day. `oi` is all-zero (equities).
+
+**Decisions:**
+- **[DECIDED] Exchange = NSE only** (drop `.BSE`). Matches the NSE bhavcopy delivery
+  layer; avoids dual-listing duplicates polluting the cross-section.
+- **[DECIDED] Daily is derived from the 15-min source**, not a separate file. 10 yr
+  of intraday is ample for daily 252-day features + multi-year training. One source
+  of truth, all frequencies aligned.
+- **[DECIDED] Retrieval via rclone (authenticated)**. Anonymous gdown rate-limits
+  after ~54 files ("many accesses"); rclone with the user's Google account has far
+  higher quotas and is resumable. `download_nse.py` (gdown) remains for convenience.
+- **[RECOMMENDED] Universe = the 68 stocks.** Indices are *averages of baskets*, not
+  peers of individual stocks — including them distorts the cross-sectional decile
+  ranking. So exclude the 13 sector + 2 size indices from the tradeable universe.
+  **Keep one broad index (NIFTY-500 or -50) aside** as the market series for the
+  regime tier (§3). Implement as a **configurable stock/index filter in
+  `consolidate.py`** so nothing is deleted and the choice is reversible.
+  - 18 indices: broad = `NIFTY-50/100/500`; sector = `NIFTY-AUTO/BANK/ENERGY/
+    FINSERV/FMCG/HEALTHCARE/INFRA/IT/METAL/MFG/OILGAS/PHARMA/REALTY`; size =
+    `NIFTY-MIDCAP-150`, `NIFTY-SMLCAP-250`.
+
+---
+
+## 2. Frequency-parametrized feature pipeline ("pick a frequency flag")
+
+Goal: resample the one 15-min source into `15min / 30min / 60min / daily` and let a
+single frequency flag select which bar series feeds features + trees, so the
+strategy sweep's "frequency axis" is real.
+
+**Decisions:**
+- **[DECIDED] D1 — Institutional features intraday = lagged broadcast.** Carry
+  prior-day (t-1) `DeliveryQty/DeliveryPct` as a within-day constant across all
+  intraday bars, so every frequency keeps the full 19 features. The 1-day lag avoids
+  EOD look-ahead. (Delivery has no intraday analog — it's an end-of-day bhavcopy
+  quantity.)
+- **[RECOMMENDED] D2 — Window units are split:**
+  - **Feature lookbacks → bars.** Reuse the same integers (`1/5/20/60/120/252`, SMA
+    `20/50/200`, vol `20/60`) as *bar counts*. A bar = one row of the selected
+    frequency (1 day on daily, 15 min on 15-min). Same integers auto-scale the
+    horizon per frequency; warm-up stays small intraday. Rename `_Nd` suffixes to
+    bar-neutral (e.g. `_Nb`) so they don't mislead.
+  - **Walk-forward train/predict windows → trading days.** Keep `504/63` in *days*,
+    not bars, so trees get enough training rows (504 bars @15min ≈ 20 days = too
+    little). The walk-forward loop slides by calendar-day groups derived from each
+    bar's timestamp. Windows become **per-frequency**.
+- **[DECIDED] D3 — Resampling:** `resample_bars.py` produces `30/60min/daily` from
+  the 15-min source (session-aware; no bin spans the overnight gap). 15-min is the
+  source itself.
+- **[DECIDED] Session-boundary targets:** null out forward targets that would span
+  the overnight gap (target bar must resolve in the same session); keep *features*
+  spanning the gap (overnight return is real signal). **Implemented** in
+  `_compute_targets(null_cross_session=...)`, on only when `bars_per_day > 1`.
+- **[DECIDED] Decoupled target retention (refinement).** The old single
+  `dropna(how="any")` required *both* the 1-bar and 5-bar labels, so the
+  restrictive 5-bar same-session constraint discarded rows valid for the 1-bar
+  label — at 60min it nuked ~72% of rows. Now `create_features` keeps a row if
+  its features are complete **and ≥1 target is defined**, leaving masked (NaN)
+  target cells in place; `tier1_trees` drops the remaining per-target NaNs inside
+  each fold. 60min retention went 319k → 959k rows, `tgt_fwd_logret_1b` fully
+  populated.
+- **[DONE] `FREQ_REGISTRY`** in `config.py`: `_FreqSpec(parquet, bars_per_day,
+  train_days, predict_days, has_institutional)` for 15min/30min/60min/daily.
+  `config.freq_spec()` resolves it. `StrategyConfig.frequency` is the live selector;
+  `data_scraping.load_bars(freq)`, `feature_creator.create_features(df, freq)`, and
+  `TreeAlphaEngine.from_frequency(freq)` all read from it. Feature lookbacks are
+  bar counts (names `_Nb`); walk-forward windows are trading days (loop slides by
+  calendar day via `searchsorted`, not by bar). **Verified end-to-end** on the real
+  parquets (daily + 60min): [-1,+1] bounds hold, decile masks correct, no leakage.
+
+---
+
+## 3. Regime detection (Tier 2 HMM) redesign
+
+**Sandbox baseline (`src/sandbox_run/tier2_regime.py`):** one synthetic index series;
+2 features (daily log return; 20-day cumsum trend); `GaussianHMM(2, full)`; fit once
+on all history; states remapped by ascending variance (0=calm, 1=panic); consumed by
+Tier 3 as a binary gate. **Two limitations that matter now:** (a) all features come
+from one series — no cross-sectional view; (b) fit-on-all-history = **look-ahead in
+the regime labels**.
+
+**Built: `src/production_ml/tier2_regime.py` (complete).** A causal, market-aware
+walk-forward Gaussian HMM. Verified on real data: COVID (Mar-2020) reads 100% Panic,
+Calm is the majority, a truncation test confirms zero look-ahead, fit+decode ~4s.
+
+**Decisions (all resolved & implemented):**
+- **[DECIDED] Market series = `NIFTY-50`.** `NIFTY-500` was the intended broad proxy
+  but is only ~58% covered in this dataset (a multi-year gap) — unusable. NIFTY-50
+  (2504 days, full history) is the barometer; NIFTY-100 is the broader fallback.
+- **[DECIDED] 3 inputs on 3 distinct axes** (not "more features" — most stress
+  metrics are collinear): `mkt_ret` (direction), `log_realized_vol` 20d (risk
+  magnitude), `avg_corr` = mean pairwise correlation of the 68 stocks (herding —
+  the one axis a single index can't see). Dispersion / semivariance / breadth
+  dropped as redundant with vol/corr (breadth kept as a possible 4th).
+- **[DONE] Frequency: HMM runs *daily*;** `broadcast_to_intraday()` maps each
+  intraday bar to the prior completed daily regime (t-1), same lagged pattern as
+  delivery — no look-ahead. (Used later by the execution tier.)
+- **[DONE] Causal fitting:** walk-forward refit (`train_days=504`, `refit_every=63`),
+  each block decoded by **forward filtering** (past-only) — not Viterbi / forward-
+  backward, which would leak future within the block.
+- **[DONE] Standardize features** with **expanding, past-only z-score**
+  (`zscore_min_periods=252`) — leak-free and scale-equalizing.
+- **[DONE] States:** default **2**, `hmm_states` sweepable to **3** (n-state-generic;
+  variance-ordered remap each refit).
+- **[DIAGNOSED] Why the raw HMM state is ~45% "Panic" — and the fix.** The states
+  are *correct* (they split on vol+herding, not noise; ~1.8σ apart; COVID 100%
+  inside), but 2 states can only **bisect** the vol continuum, so the upper state
+  ≈ the above-median-vol half (~45%). And posteriors **saturate** — self-transition
+  ≈ 0.98 because vol is genuinely persistent, so the filter is >90% confident on
+  ~92% of days — which means a *probability cutoff can never be a frequency dial*
+  (no mass in the middle to move). Top-state fraction only falls with more states
+  (2→45%, 3→27%, 4→12%). **Resolution: two separate outputs.**
+  - *HMM regime* (`states`/`probs`): the vol/herding taxonomy + posteriors (for the
+    feature-injection path). Not a crisis flag.
+  - *De-risk gate* (`panic`/`stress`): a **causal severity-percentile** on a
+    continuous stress score (mean of z-vol & z-herding). `panic_threshold` (default
+    0.85) marks the top ~15% most-stressed days vs their own trailing history —
+    leak-free, monotone frequency control (realized ~21% here; drifts above target
+    in rising-vol eras because the trailing quantile lags — expected/desirable).
+    `transmat_stickiness` is a persistence/turnover knob only, **not** a frequency
+    control (it slightly *raises* the high-vol share here).
+  The *sandbox* Tier 3 hard-codes a binary gate — the (deferred) *production*
+  execution tier consumes `panic` (and/or `probs`/`stress`) generically.
+- **[DECIDED] Integration = gate-first, feature-ready.** Regime will size the tree
+  book (calm → lever longs, panic → neutral/cash) — mirrors `dynamic_tilt`. Built
+  causally and emits per-state **posteriors** (`RegimeResult.probs`) so option (b),
+  regime-as-tree-feature, drops in later via a toggle. Option (c) conditional models
+  deferred. This pass ships the detector only; the execution/gate + injection are
+  designed-for but not wired.
+
+---
+
+## 4. Orchestration (built)
+
+- **[DONE] `run_pipeline_ml.py` orchestrator exists.** Separate top-level script
+  (not a MODE branch), chaining `load bars(freq) → create_features(freq) →
+  TreeAlphaEngine → regime → execution → production DSR ledger`. Delivery
+  augmentation is skipped for now (create_features falls back to 17 price-only
+  features); wiring live delivery is a follow-up.
+- **[DONE] Back half wired:** `src/production_ml/tier3_execution.py`
+  (`execute_ml_strategy`) converts tree masks + the regime `panic` gate →
+  per-day variable-k weights → portfolio returns; `tier4_dsr.log_to_dsr_ledger`
+  gained an optional `ledger_path` so PRODUCTION_ML writes a dedicated
+  `production_dsr_matrix.parquet` (sensitivity runs a second file).
+- **[DECIDED] Sweep scope.** Committed **[SWEEP]** axes are `frequency` ×
+  `execution_style` = **12 cells**. `hmm_states` was **dropped from the grid**:
+  the execution tier gates only on the n_states-independent `panic` score, so a
+  2- vs 3-state HMM is return-identical today — sweeping it would inflate the
+  multiple-testing count for no impact. It is frozen at
+  `config.HEADLINE_HMM_STATES = 2`; making it matter (state-conditional sizing /
+  regime-as-tree-feature) is captured in **`docs/phase3_deferred_hmm.md`**.
+  `panic_threshold` / `decile_pct` are **[SENSITIVITY]** (opt-in, separate
+  entrypoint + separate ledger); `lookback_period` has no tree analog and is
+  parked. Leverage split (130/30 → `_ExecutionConfig`), tree hyperparameters,
+  and regime plumbing are **[FIXED]** priors. Orchestrator honors R1–R5.
+
+---
+
+## Build order (current)
+
+```
+✅ download_nse.py     gdown puller (rate-limited past ~54; rclone is the real path)
+✅ consolidate.py      per-stock CSVs → one long 15-min Parquet  (+ stock/index filter)
+✅ resample_bars.py    15-min → 30/60min/daily  (session-aware, validated)
+✅ full dataset        68 stocks consolidated + resampled to 4 aligned parquets
+✅ FREQ_REGISTRY + frequency-aware loader / feature_creator / tier1_trees
+✅ Tier 2 HMM redesign — causal market-aware regime detector (tier2_regime.py)
+✅ Sweep-scope design — docs/phase3_design_requirements.md (which axes to sweep)
+✅ Sweep priors in code — config.py (_ExecutionConfig, decile_pct, SWEEP_*/SENSITIVITY_BANDS)
+✅ PRODUCTION_ML execution/gate tier — tier3_execution.py (masks + panic → weights → returns)
+✅ PRODUCTION_ML orchestrator — run_pipeline_ml.py (12-cell grid + sensitivity mode, R1–R5)
+⬜ Regime-as-tree-feature injection (the "feature" half; posteriors already emitted)
+⬜ hmm_states given real teeth — state-conditional sizing (docs/phase3_deferred_hmm.md)
+⬜ Live delivery augmentation in the orchestrator (currently 17 price-only features)
+⬜ Full 24→12-cell sweep at all frequencies incl. 15-min (verified on the daily slice)
+```
+
+## What's left (next-session pickup)
+
+1. **Run the full grid at all frequencies.** Verified end-to-end on the `daily`
+   slice (3 cells, Sharpe ~1.6–1.8); run `python run_pipeline_ml.py` for the full
+   12 cells (15/30/60min are the slow tree fits — see phase3 §2 compute ceiling).
+2. **Wire live delivery augmentation** into the orchestrator loader so the full
+   19-feature schema is used (currently price-only 17; create_features already
+   falls back gracefully).
+3. **Regime-as-tree-feature injection** and **state-conditional sizing** — the two
+   deferred paths that give `hmm_states` real impact; see `docs/phase3_deferred_hmm.md`.
