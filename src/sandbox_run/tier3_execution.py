@@ -1,5 +1,15 @@
+import os
+import sys
+
 import numpy as np
 import pandas as pd
+
+# Running this module directly (`python src/sandbox_run/tier3_execution.py`) puts src/
+# on sys.path, not the repo root, so `import config` would fail. The production_ml
+# modules already carry this guard; the sandbox ones were missed.
+_ROOT: str = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from config import StrategyConfig
 

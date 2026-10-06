@@ -1,0 +1,50 @@
+ticker,date,ret,category,evidence,note
+# Audited register of post-adjustment |daily return| > 35% events on IN-UNIVERSE bars.
+# Gate 6 in bhavcopy_validate.py requires every such event to appear here. A rebuild that
+# produces an event NOT listed fails the gate - that is the point: it is a tripwire for a
+# newly missed corporate action, not a suppression list.
+#
+# category:
+#   news     - a genuine market move. Signature: turnover SPIKES (2-80x the trailing
+#              median) and the price ratio does NOT land on a simple fraction. Keep as-is;
+#              this is real return the strategy should experience.
+#   demerger - the parent's price drops by the value of a spun-off entity. Signature:
+#              turnover COLLAPSES (0.0-0.4x) and the ratio DOES snap to a simple fraction.
+#              Deliberately NOT adjusted: holders receive shares in the new entity, so
+#              total wealth is roughly unchanged, but this panel cannot track the spin-off.
+#              The parent therefore books a fake loss. Known limitation, biases returns
+#              DOWNWARD (conservative), 8 events in 1.24M in-universe bars.
+#   penny    - price below the Rs 20 detection floor, where the tick grid makes real and
+#              spurious ratios indistinguishable. Left unadjusted by design.
+JETAIRWAYS,2019-06-20,1.2288,news,turnover 3.3x; no rational snap,grounding/insolvency news
+RCOM,2018-05-17,0.6651,news,turnover 7.3x; no snap,Ericsson settlement news
+AMTEKAUTO,2015-09-11,0.4984,news,turnover 5.6x; no snap,distress rebound
+INDUSINDBK,2020-03-26,0.4572,news,turnover 1.5x; no snap,COVID-crash rebound day
+PCJEWELLER,2018-05-04,0.4321,news,turnover 17.5x; no snap,post-crash rebound
+BANDHANBNK,2020-03-26,0.4189,news,turnover 1.7x; no snap,COVID-crash rebound day
+RCOM,2017-12-26,0.4110,news,turnover 13.4x; no snap,asset-sale news
+EMBDL,2017-04-17,0.4104,news,turnover 80.8x; no snap,news spike on very thin base
+ZEEL,2021-09-14,0.3991,news,turnover 44.8x; no snap,Sony merger announcement
+CANBK,2017-10-25,0.3920,news,turnover 22.9x; no snap,PSU bank recapitalisation announcement
+RELINFRA,2019-06-20,0.3876,news,turnover 2.2x; no snap,group news
+SWANDEF,2018-01-01,0.3860,news,turnover 55.1x; no snap,news spike on thin base
+IDEA,2020-02-19,0.3770,news,turnover 4.6x; no snap,AGR dues ruling
+PCJEWELLER,2018-05-07,0.3759,news,turnover 27.6x; no snap,continued rebound
+IDEA,2019-11-19,0.3516,news,turnover 6.4x; no snap,AGR relief news
+UNITECH,2015-06-03,-0.3657,news,turnover 12.0x; snaps 0.636 but volume spiked,court ruling
+# Added after the ISIN-linking rebuild (2026-08-05). Merging 467 reissues lengthened
+# several histories, so these names now qualify for the universe over spans they did not
+# before - the events themselves are not new. Classified by the same signature test as
+# every row above; PNB is the SAME PSU-recapitalisation day as CANBK, already registered.
+YESBANK,2020-03-17,0.5952,news,turnover 2.1x; no snap,SBI-led reconstruction scheme
+PNB,2017-10-25,0.4949,news,turnover 45.1x; no snap,PSU bank recapitalisation (same day as CANBK)
+YESBANK,2020-03-16,0.4530,news,turnover 1.0x; no snap; 3d gap,post-moratorium resumption
+GFLLIMITED,2019-08-06,-0.8903,demerger,turnover 0.1x; snaps 0.111,Gujarat Fluorochemicals demerger
+NIITLTD,2023-06-08,-0.7629,demerger,turnover 0.2x; snaps 0.231,NIIT Learning Systems demerger
+STAR,2024-12-06,-0.5404,demerger,turnover 0.2x; snaps 0.462,OneSource Specialty demerger
+IIFL,2019-05-30,-0.5382,demerger,turnover 0.2x; snaps 0.462,IIFL Holdings three-way demerger
+OMKARCHEM,2017-06-12,-0.5378,demerger,turnover 0.1x; snaps 0.462,Lasa Supergenerics demerger
+EDELWEISS,2023-06-02,-0.4507,demerger,turnover 0.0x; snaps 0.550,Nuvama Wealth demerger
+BCG,2022-03-15,-0.3702,demerger,turnover 0.1x; snaps 0.632,demerger/restructuring
+TATACOMM,2019-09-17,-0.3525,demerger,turnover 0.1x; snaps 0.647,Hemisphere Properties demerger
+KSERASERA,2015-03-30,-0.8841,penny,price Rs 0.40; below the Rs 20 detection floor,unadjustable by design

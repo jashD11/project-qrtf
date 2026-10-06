@@ -1,5 +1,23 @@
 data/
+logs/
 __pycache__/
 *.pyc
 .DS_Store
 .env
+CLAUDE.md
+profile.txt
+
+# local tooling and virtualenvs
+.claude/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# LaTeX build artefacts from scripts/build_beamer.py
+docs/presentation/*.log
+
+# session working files — audits and briefs, not part of the project
+RESUME_BRIEF*.md
+CLEANUP_PLAN_*.md
+CLEANUP_SUMMARY_*.md
