@@ -293,6 +293,9 @@ TRIAL_LEDGER: list[tuple[str, int, str]] = [
     ("phase5 §8.3 perfect-foresight short leg", 0,
      "infeasible by construction — a ceiling, not a strategy"),
     ("phase5 cost-aware, 2 methods x 3 styles x 2 targets", 12, "docs/phase5_plan.md §7"),
+    ("phase6 Part A decay diagnostics (per-learner, ridge, ceiling, window probe)", 0,
+     "read-only, never promoted; any Part B use is judged on the sealed post-2025-06 "
+     "holdout with its own N (docs/phase6_plan.md §A.1, §A.6)"),
 ]
 TRIALS_SEARCHED: int = sum(n for _, n, _ in TRIAL_LEDGER)   # = 42
 
