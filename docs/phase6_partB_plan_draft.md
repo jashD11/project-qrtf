@@ -11,7 +11,8 @@
   bit-identical, and worth 3% of IC at 5b and 13% at 21b.
 
 **Not done**
-- Stages 2–9. Stages 0 and 1 are complete: §B is pre-registered and committed (2026-10-14).
+- Stages 3–9. Stages 0–2 are complete: §B is pre-registered and committed, and monthly
+  rebalancing is built and verified (2026-10-14).
 - The purged ensemble re-score of the Phase 5 grid was started and then paused. Stage 7's F0
   fits replace it.
 - This plan is a draft. The user reviewed it but interrupted approval to deal with machine
@@ -43,7 +44,7 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** start at Stage 2 (monthly rebalancing in Tier 3), then Stages 3–6, then Stage 7
+**Resume:** start at Stage 3 (F1 price and index features), then Stages 4–6, then Stage 7
 on a night with a suitable charger or with lowered `rf.n_jobs`.
 
 ## Context
@@ -114,7 +115,13 @@ own pre-registration.
 Allowed before the freeze is committed: coverage, NaN and distribution checks on new
 features. **Not allowed: any computation that touches returns** (IC, Sharpe).
 
-## Stage 2 — monthly rebalancing in Tier 3 (opt-in)
+## Stage 2 — monthly rebalancing in Tier 3 (opt-in): DONE (2026-10-14)
+
+Result: the default config reproduces the Phase 5 ledger **4/4 bit-identical**
+(`data/trial_database/regression/phase6_stage2*`). The Tier 3 dry-run has 17 new
+rebalance checks, and all 58 checks pass. `no_lookahead_check.py` gained a
+`cost_swap_R21` case: 24/24 pass, and the canary is caught. Logs are in
+`data/trial_database/phase6/logs/stage2_*`.
 
 - **`StrategyConfig.rebalance_every: int = 1`.** It is hashed into `strategy_id` only when it
   is not 1 (tag `_R21`), the same pattern as `construction` and `purge_label_overlap` in
@@ -124,7 +131,8 @@ features. **Not allowed: any computation that touches returns** (IC, Sharpe).
     are every Nth bar from the first OOS bar. Weights are held constant in between, so
     `weights.diff()` charges nothing between rebalances.
   - Forced exits still happen on any bar: a name leaving the universe, or losing its borrow
-    on the short leg.
+    on the short leg. The slot is refilled the same bar with the best eligible top-decile
+    name, and the participation cap is held from the rebalance bar (§B.8, 2026-10-14).
   - The panic gate stays daily.
   - The M2 swap decision (`cost_aware.py`) runs on rebalance bars only.
 - **Verification.**

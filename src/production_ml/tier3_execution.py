@@ -627,6 +627,71 @@ def _short_mask_from_scores(
 
 
 # --------------------------------------------------------------------------- #
+# Phase 6 — periodic rebalancing (docs/phase6_plan.md §B.3)
+# --------------------------------------------------------------------------- #
+def rebalance_bars(index: pd.Index, every: int) -> pd.Index:
+    """Every ``every``-th scored bar, counted from the first: the bars a book is chosen on."""
+    if every < 1:
+        raise ValueError(f"rebalance_every must be >= 1, got {every}")
+    return index[::every]
+
+
+def hold_between_rebalances(
+    mask_at_rebal: pd.DataFrame,
+    scores: pd.DataFrame,
+    decile_pct: float,
+    short_leg: bool,
+) -> pd.DataFrame:
+    """
+    Carry one leg's book from each rebalance bar to the next, trading only forced exits.
+
+    The selection rule runs on the rebalance bars only, so it compares each new book with
+    the one actually held since the last rebalance; this fills the bars in between, on
+    ``scores.index``. ``scores`` is the leg's candidate set: the alpha scores, with
+    unborrowable names blanked on an ``_slb`` short leg.
+
+    - A held name that stops being rankable (it left the universe, or a short lost its
+      borrow) is sold on that bar.
+    - Its slot is refilled on the same bar with the best-ranked eligible name in that
+      bar's enter band (top ``decile_pct``) not already held. That is the empty-slot rule
+      every construction already follows. Without the refill a leg can drain between
+      rebalances, and an ``_slb`` book with no shorts left is simply net long.
+    - Nothing else trades: held names that are still rankable are kept whatever their
+      rank, and the leg's size stays what the rebalance bar chose.
+
+    Causal: the book comes from earlier bars, and the ranks and eligibility read on a bar
+    are that bar's own. Like the buffers, this is a sequential O(k) loop over bars.
+    """
+    index, columns = scores.index, scores.columns
+    ranks = scores.rank(axis=1, ascending=short_leg, method="first").to_numpy()
+    valid_counts = scores.notna().sum(axis=1).to_numpy()
+    is_rebal = index.isin(mask_at_rebal.index)
+    chosen = mask_at_rebal.reindex(index).fillna(0).to_numpy() != 0
+    held = np.zeros((len(index), len(columns)), dtype=np.int8)
+
+    book: list[int] = []
+    size = 0
+    for t in range(len(index)):
+        rank_row = ranks[t]
+        if is_rebal[t]:
+            book = [int(c) for c in np.flatnonzero(chosen[t])]
+            size = len(book)
+        else:
+            book = [c for c in book if np.isfinite(rank_row[c])]
+            if len(book) < size:
+                k_enter = max(1, int(np.floor(int(valid_counts[t]) * decile_pct)))
+                band = np.flatnonzero(rank_row <= k_enter)
+                band = band[np.argsort(rank_row[band])]
+                keep = set(book)
+                book += [int(c) for c in band if int(c) not in keep][: size - len(book)]
+        held[t, book] = 1
+
+    sign = -1 if short_leg else 1
+    out = pd.DataFrame(sign * held, index=index, columns=columns)
+    return out.astype(mask_at_rebal.dtypes.iloc[0])
+
+
+# --------------------------------------------------------------------------- #
 # Strategy execution
 # --------------------------------------------------------------------------- #
 def run_execution(
@@ -701,6 +766,25 @@ def run_execution(
     construction: str = getattr(cfg, "construction", "buffer")
     if construction not in _CONSTRUCTIONS:
         raise ValueError(f"Unknown construction {construction!r}. Valid: {_CONSTRUCTIONS}")
+
+    # Phase 6 periodic rebalancing. With every > 1 the selection below sees only the
+    # rebalance bars, so its sequential state (the previous book) is the book actually
+    # held; hold_between_rebalances fills the bars in between. every == 1 never slices,
+    # so the pre-Phase-6 path is untouched.
+    every: int = int(getattr(cfg, "rebalance_every", 1))
+    if every == 1:
+        sel, sel_short, sel_wf = alpha, short_scores, wf_result
+    else:
+        on = rebalance_bars(alpha.index, every)
+        sel = alpha.loc[on]
+        sel_short = None if short_scores is None else short_scores.loc[on]
+        sel_wf = WalkForwardResult(**{
+            **wf_result.__dict__,
+            "alpha_scores": sel,
+            "long_mask": wf_result.long_mask.reindex(on),
+            "short_mask": wf_result.short_mask.reindex(on),
+        })
+
     if construction != "buffer":
         if not (cost_cfg.apply_costs and cost_cfg.charge_per_name):
             raise ValueError(
@@ -709,34 +793,46 @@ def run_execution(
             )
         from src.production_ml import cost_aware
 
-        n_valid = alpha.notna().sum(axis=1)
+        n_valid = sel.notna().sum(axis=1)
         k_per_bar = np.floor(n_valid * cfg.decile_pct).clip(lower=1)
         decision_cost = cost_aware.decision_cost_bps(
-            panels, alpha.index, alpha.columns, k_per_bar, cost_cfg
+            panels, sel.index, sel.columns, k_per_bar, cost_cfg
         )
         if construction == "cost_band":
             long_mask, short_mask = cost_aware.apply_cost_band_buffer(
-                alpha, cfg, decision_cost, short_scores=short_scores
+                sel, cfg, decision_cost, short_scores=sel_short
             )
         else:  # cost_swap — needs the causal IC (from realised prices) and sigma
             horizon = cost_aware.target_horizon(cfg.target_col)
+            # The IC is estimated from every scored bar's realised return, not only the
+            # rebalance bars': the trailing record of skill does not depend on when the
+            # book trades, and the h+1-bar embargo is in price-panel bars either way.
             ic = cost_aware.trailing_ic(alpha, price_wide, horizon)
+            if every != 1:
+                ic = ic.reindex(sel.index)
             sigma = align_cost_panel(
-                panels.sigma, alpha.index, alpha.columns, "sigma(E)", verbose=False
+                panels.sigma, sel.index, sel.columns, "sigma(E)", verbose=False
             )
-            exp_ret = cost_aware.expected_return(alpha, sigma, ic, horizon)
+            exp_ret = cost_aware.expected_return(sel, sigma, ic, horizon)
             long_mask, short_mask = cost_aware.apply_cost_swap_buffer(
-                alpha, cfg, decision_cost, exp_ret, short_scores=short_scores
+                sel, cfg, decision_cost, exp_ret, short_scores=sel_short
             )
     elif cfg.rebalance_buffer_mult > 1.0:
-        long_mask, short_mask = apply_rebalance_buffer(alpha, cfg, short_scores=short_scores)
+        long_mask, short_mask = apply_rebalance_buffer(sel, cfg, short_scores=sel_short)
     else:
-        long_mask = wf_result.long_mask
-        short_mask = wf_result.short_mask
-        if short_scores is not None:
-            n_valid = alpha.notna().sum(axis=1)
+        long_mask = sel_wf.long_mask
+        short_mask = sel_wf.short_mask
+        if sel_short is not None:
+            n_valid = sel.notna().sum(axis=1)
             k_per_day = np.floor(n_valid * cfg.decile_pct).clip(lower=1).astype(int)
-            short_mask = _short_mask_from_scores(short_scores, k_per_day)
+            short_mask = _short_mask_from_scores(sel_short, k_per_day)
+
+    if every != 1:
+        long_mask = hold_between_rebalances(long_mask, alpha, cfg.decile_pct, short_leg=False)
+        short_mask = hold_between_rebalances(
+            short_mask, alpha if short_scores is None else short_scores,
+            cfg.decile_pct, short_leg=True,
+        )
 
     panic_bars: pd.Series = _align_panic(panic, long_mask.index, cfg.frequency)
 
@@ -750,6 +846,12 @@ def run_execution(
             panels.adv, long_mask.index, long_mask.columns, "adv(cap)", verbose=False
         )
         max_weight = cost_cfg.max_participation * adv / cost_cfg.aum_rupees
+        if every != 1:
+            # The cap is set when the book is chosen and held with it. Re-capping on
+            # each day's ADV would re-weight a held book between rebalances, a trade
+            # the schedule exists to avoid.
+            on_rebal = max_weight.index.isin(rebalance_bars(alpha.index, every))
+            max_weight = max_weight.loc[on_rebal].reindex(max_weight.index).ffill()
 
     weights: pd.DataFrame = build_weight_matrix(
         long_mask, short_mask, panic_bars, cfg, max_weight=max_weight,
@@ -1210,6 +1312,144 @@ if __name__ == "__main__":
     checks["run_execution short_scale=1 == None"] = bool(res_one.net.equals(res_none.net))
     checks["ExecutionResult carries the weights"] = bool(
         res_none.weights is not None and res_none.weights.index.equals(res_none.net.index)
+    )
+
+    # 9. Phase 6 periodic rebalancing (docs/phase6_plan.md §B.3). A 60-name world with a
+    #    persistent AR(1) signal, so a book actually holds names from bar to bar.
+    rr = np.random.default_rng(23)
+    nb, nn, every = 260, 60, 21
+    rdates = pd.bdate_range("2021-01-01", periods=nb)
+    rnames = pd.Index([f"R{i:02d}" for i in range(nn)])
+    sig = np.zeros((nb, nn))
+    sig[0] = rr.normal(size=nn)
+    for t_ in range(1, nb):
+        sig[t_] = 0.9 * sig[t_ - 1] + np.sqrt(1 - 0.81) * rr.normal(size=nn)
+    ralpha = pd.DataFrame(sig, index=rdates, columns=rnames)
+    rprice = pd.DataFrame(
+        100 * np.exp(np.cumsum(rr.normal(0, 0.01, (nb, nn)), axis=0)), index=rdates, columns=rnames
+    )
+    rwf = WalkForwardResult(alpha_scores=ralpha, long_mask=ralpha * 0, short_mask=ralpha * 0)
+    calm = pd.Series(False, index=rdates)
+    on = rebalance_bars(rdates, every)
+    off = ~rdates.isin(on)
+
+    def _rcfg(style, every_=1, construction="buffer"):
+        return StrategyConfig(
+            is_simulation=False, market_type="dryrun", lookback_period=0, hmm_states=2,
+            execution_style=style, frequency="daily", construction=construction,
+            rebalance_every=every_,
+        )
+
+    r_daily = run_execution(rwf, calm, rprice, _rcfg("long_short"))
+    r_one = run_execution(rwf, calm, rprice, _rcfg("long_short", 1))
+    r_mon = run_execution(rwf, calm, rprice, _rcfg("long_short", every))
+    checks["rebalance_every=1 == default (bit-for-bit)"] = bool(
+        r_one.net.equals(r_daily.net) and r_one.weights.equals(r_daily.weights)
+    )
+    id_default = _rcfg("long_short").strategy_id
+    id_mon = _rcfg("long_short", every).strategy_id
+    checks["rebalance_every=1 leaves strategy_id alone"] = bool(
+        "_R" not in id_default.rsplit("_", 1)[0] and _rcfg("long_short", 1).strategy_id == id_default
+    )
+    checks["rebalance_every=21 gets its own id (_R21)"] = bool(
+        f"_R{every}_" in id_mon and id_mon != id_default
+    )
+    to_m = r_mon.turnover
+    checks["R21: zero turnover between rebalances"] = bool(
+        (to_m.reindex(rdates[off]).dropna() == 0.0).all()
+    )
+    checks["R21: trades on rebalance bars"] = bool((to_m.reindex(on).dropna() > 0).any())
+    checks["R21: cuts turnover vs daily"] = bool(to_m.sum() < r_daily.turnover.sum())
+    # On each rebalance bar the book is the buffer run on the rebalance bars alone.
+    sub_l, sub_s = apply_rebalance_buffer(ralpha.loc[on], _rcfg("long_short"))
+    w_on = r_mon.weights.reindex(on).dropna(how="all")
+    checks["R21: rebalance books == buffer on rebalance bars"] = bool(
+        ((w_on > 0).astype(int).equals((sub_l.loc[w_on.index] == 1).astype(int)))
+        and ((w_on < 0).astype(int).equals((sub_s.loc[w_on.index] == -1).astype(int)))
+    )
+
+    # Forced exit: a held long name leaves the universe for one bar mid-segment. It must
+    # be sold that bar, its slot refilled that bar, and it stays out until the next
+    # rebalance even once it is back.
+    seg_start, nxt = on[2], on[3]
+    held0 = r_mon.weights.loc[seg_start]
+    victim = held0[held0 > 0].index[0]
+    gone = rdates[rdates.get_loc(seg_start) + 5]
+    falpha = ralpha.copy()
+    falpha.loc[gone, victim] = np.nan
+    fwf = WalkForwardResult(alpha_scores=falpha, long_mask=falpha * 0, short_mask=falpha * 0)
+    r_f = run_execution(fwf, calm, rprice, _rcfg("long_short", every))
+    between = rdates[(rdates >= gone) & (rdates < nxt)]
+    checks["R21 forced exit: sold on the bar it leaves"] = bool(
+        r_f.weights.loc[gone, victim] == 0.0 and r_f.turnover.loc[gone] > 0
+    )
+    checks["R21 forced exit: stays out until next rebalance"] = bool(
+        (r_f.weights.loc[between, victim] == 0.0).all()
+    )
+    checks["R21 forced exit: leg gross stays 1.0"] = bool(
+        np.allclose(r_f.weights.clip(lower=0).sum(axis=1), 1.0)
+    )
+    w_prev = r_f.weights.shift(1)
+    entries = ((r_f.weights != 0) & (w_prev == 0)).sum(axis=1)
+    exits = ((r_f.weights == 0) & (w_prev != 0)).sum(axis=1)
+    mid = rdates[off][1:].intersection(r_f.weights.index)
+    checks["R21 forced exit: its slot is refilled that bar"] = bool(
+        entries.loc[gone] == 1 and exits.loc[gone] == 1
+        and (r_f.weights.loc[gone] > 0).sum() == (held0 > 0).sum()
+    )
+    checks["R21: between rebalances, entries only replace exits"] = bool(
+        (entries.loc[mid] == exits.loc[mid]).all()
+        and (entries.loc[mid].drop(gone) == 0).all()
+    )
+
+    # SLB: a held short loses its borrow mid-segment. The book must short only borrowable
+    # names on every bar and stay dollar-neutral throughout.
+    rshort = pd.DataFrame(rr.random((nb, nn)) > 0.2, index=rdates, columns=rnames)
+    rpanels = CostPanels(
+        adv=pd.DataFrame(rr.uniform(5e6, 5e8, (nb, nn)), index=rdates, columns=rnames),
+        sigma=pd.DataFrame(rr.uniform(0.01, 0.04, (nb, nn)), index=rdates, columns=rnames),
+        half_spread_bps=pd.DataFrame(rr.uniform(2, 40, (nb, nn)), index=rdates, columns=rnames),
+        shortable=rshort,
+    )
+    r_slb = run_execution(rwf, calm, rprice, _rcfg("long_short_slb", every), panels=rpanels)
+    checks["R21 SLB: shorts only borrowable names"] = bool(
+        not ((r_slb.weights < 0) & ~rshort.reindex_like(r_slb.weights)).to_numpy().any()
+    )
+    checks["R21 SLB: dollar-neutral on every bar"] = bool(
+        np.allclose(r_slb.net_exposure.to_numpy(), 0.0, atol=1e-9)
+    )
+    checks["R21 SLB: lost borrow forces trades mid-segment"] = bool(
+        (r_slb.turnover.reindex(rdates[off]).dropna() > 0).any()
+    )
+
+    # The panic gate stays daily: a panic block inside a segment flattens long_only.
+    rpanic = pd.Series(False, index=rdates)
+    rpanic.iloc[on.size and rdates.get_loc(on[4]) + 3: rdates.get_loc(on[4]) + 9] = True
+    r_pg = run_execution(rwf, rpanic, rprice, _rcfg("long_only", every))
+    pbars = rdates[rpanic.to_numpy()]
+    checks["R21: panic still flattens mid-segment"] = bool(
+        (r_pg.weights.reindex(pbars).abs().sum(axis=1) == 0).all()
+    )
+
+    # M2 + participation cap under R21: the swap rule and the cap are both evaluated on
+    # rebalance bars only, so a book whose ADV moves every day still does not trade
+    # between rebalances.
+    saved_cost = config.ML_CONFIG.cost
+    config.ML_CONFIG.cost = _replace(
+        saved_cost, charge_per_name=True, aum_rupees=1e9, enforce_participation_cap=True
+    )
+    try:
+        r_cs = run_execution(rwf, calm, rprice, _rcfg("long_short", every, "cost_swap"),
+                             panels=rpanels)
+        r_cs_daily = run_execution(rwf, calm, rprice, _rcfg("long_short", 1, "cost_swap"),
+                                   panels=rpanels)
+    finally:
+        config.ML_CONFIG.cost = saved_cost
+    checks["R21 M2+cap: zero turnover between rebalances"] = bool(
+        (r_cs.turnover.reindex(rdates[off]).dropna() == 0.0).all()
+    )
+    checks["R21 M2+cap: net NaN-free, trades less than daily"] = bool(
+        r_cs.net.notna().all() and r_cs.turnover.sum() < r_cs_daily.turnover.sum()
     )
 
     print()

@@ -405,9 +405,20 @@ its own pre-registration.
   archive) runs during the F2 build. If they reach 2013, delivery becomes a separately
   pre-registered F3.
 
-### B.8 · Deviations log
+### B.8 · Deviations and clarifications log
 
 Implementation may deviate from B.2 only for data-quality reasons, never for a reason based
-on returns. Every deviation is logged here with its date and reason before the run.
+on returns. Every deviation, and every point where the implementation had to settle something
+§B left open, is logged here with its date and reason before the run.
 
-*(none yet)*
+- **2026-10-14 · B.3, forced exits between rebalances (clarification).** §B.3 says forced exits
+  trade on any bar but does not say what fills the slot. **The slot is refilled on the same
+  bar** with the best-ranked eligible name in that bar's top decile not already held. Every
+  construction already follows this rule for empty slots ("forced exits and empty slots
+  always trade"). Nothing else trades between rebalances, and the leg keeps the size chosen
+  on the rebalance bar.
+  - **Why.** Found in the Stage 2 dry-run, on synthetic data, before any Part B number
+    existed. Without a refill, a leg can drain between rebalances. An `_slb` book whose short
+    leg has drained is net long, so it breaks the dollar-neutrality that B.4's checks require.
+  - **The participation cap** is likewise set on the rebalance bar and held with the book.
+    Re-capping on each day's ADV would re-weight a held book between rebalances.

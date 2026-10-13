@@ -509,6 +509,11 @@ class StrategyConfig:
                                   # fitted without the h training bars whose labels
                                   # reach into the scored block. A different fit, so
                                   # a different id — hashed (tag _PG) only when on.
+    rebalance_every: int = 1  # Phase 6 Part B (docs/phase6_plan.md §B.3): the book is
+                              # re-selected only on every Nth scored bar and held in
+                              # between, except for forced exits (a name leaves the
+                              # universe, or a short loses its borrow). 1 = every bar,
+                              # the pre-Phase-6 path. Hashed (tag _R<N>) only when != 1.
 
     @property
     def strategy_id(self) -> str:
@@ -536,6 +541,8 @@ class StrategyConfig:
             )
         if self.purge_label_overlap:
             prefix += "_PG"
+        if self.rebalance_every != 1:
+            prefix += f"_R{self.rebalance_every}"
 
         # All parameters included so every distinct permutation hashes uniquely
         param_string: str = (
@@ -550,6 +557,8 @@ class StrategyConfig:
             param_string += f"_{self.construction}"
         if self.purge_label_overlap:
             param_string += "_purge"
+        if self.rebalance_every != 1:
+            param_string += f"_rebal{self.rebalance_every}"
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 
         return f"{prefix}_{param_hash}"

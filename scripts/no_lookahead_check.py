@@ -57,6 +57,10 @@ STYLES = ["long_only", "long_short_slb"]      # the long-only control + the SLB 
 # Every portfolio construction the engine can run (docs/phase5_plan.md §7). The Phase 5
 # ones read cost panels, sigma and (M2) a trailing IC from prices — all scrambled below.
 CONSTRUCTIONS = ["buffer", "cost_band", "cost_swap"]
+# Phase 6 Part B trades the 21b label on a 21-bar schedule under M2 (docs/phase6_plan.md
+# §B.3). Its forced-exit refills between rebalances read that bar's ranks and borrow
+# state, so the schedule is checked as its own case.
+CASES = [(c, 1) for c in CONSTRUCTIONS] + [("cost_swap", 21)]
 CUT_FRACTIONS = [0.25, 0.50, 0.75]           # cut dates as a share of the scored bars
 SEED = 7
 
@@ -144,23 +148,26 @@ def main() -> int:
     calm = bars[~panic.reindex(bars).fillna(False).astype(bool).to_numpy()]
     cuts = [calm[calm >= bars[int(len(bars) * f)]][0] for f in CUT_FRACTIONS]
 
-    def run(wf_, price_, panic_, panels_, style, construction="buffer"):
-        cfg = make_ml_config(FREQUENCY, style, target_col=TARGET, construction=construction)
+    def run(wf_, price_, panic_, panels_, style, construction="buffer", every=1):
+        cfg = make_ml_config(FREQUENCY, style, target_col=TARGET, construction=construction,
+                             rebalance_every=every)
         return run_execution(wf_, panic_, price_, cfg, terminal_returns=terminal, panels=panels_)
 
     ok = True
     rows = []
-    for construction in CONSTRUCTIONS:
+    for construction, every in CASES:
         for style in STYLES:
-            base = run(wf, price_wide, panic, panels, style, construction)
+            base = run(wf, price_wide, panic, panels, style, construction, every)
             for i, cut in enumerate(cuts):
                 rng = np.random.default_rng(SEED + i)
-                pert = run(*_perturb(wf, price_wide, panic, panels, cut, rng), style, construction)
+                pert = run(*_perturb(wf, price_wide, panic, panels, cut, rng), style,
+                           construction, every)
                 bad = _first_divergence(base, pert, cut)
                 reached = _changed_after(base, pert, cut)
                 passed = not bad and reached
                 ok &= passed
-                rows.append((f"{construction}/{style}", cut.date(), "PASS" if passed else "FAIL",
+                label = construction + (f"_R{every}" if every != 1 else "")
+                rows.append((f"{label}/{style}", cut.date(), "PASS" if passed else "FAIL",
                              "perturbation reached engine" if reached else "PERTURBATION HAD NO EFFECT",
                              ", ".join(bad) or "-"))
 
@@ -183,9 +190,9 @@ def main() -> int:
     print("\n" + "=" * 96)
     print("NO-LOOK-AHEAD CHECK — inputs after the cut replaced by noise; decisions up to it must not move")
     print("=" * 96)
-    print(f"  {'construction/style':<26} {'cut':<12} {'verdict':<8} {'sanity':<28} diverged series")
+    print(f"  {'construction/style':<30} {'cut':<12} {'verdict':<8} {'sanity':<28} diverged series")
     for r in rows:
-        print(f"  {r[0]:<26} {str(r[1]):<12} {r[2]:<8} {r[3]:<28} {r[4]}")
+        print(f"  {r[0]:<30} {str(r[1]):<12} {r[2]:<8} {r[3]:<28} {r[4]}")
     print(f"  canary (alpha shifted one bar early) caught: {'PASS' if caught else 'FAIL — the test cannot see a leak'}")
     print("=" * 96)
     print(f"VERDICT: {'causal — no decision reads the future' if ok else 'FAIL'}")

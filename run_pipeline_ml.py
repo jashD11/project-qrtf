@@ -107,6 +107,7 @@ def make_ml_config(
     target_col: str = DEFAULT_TARGET,
     construction: str = "buffer",
     purge_label_overlap: bool | None = None,
+    rebalance_every: int = 1,
 ) -> StrategyConfig:
     """
     A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels.
@@ -128,6 +129,7 @@ def make_ml_config(
         target_col=target_col,
         construction=construction,
         purge_label_overlap=purge_label_overlap,
+        rebalance_every=rebalance_every,
     )
 
 
