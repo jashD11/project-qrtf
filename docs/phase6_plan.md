@@ -404,6 +404,13 @@ its own pre-registration.
   504-day window plus a holdout. A read-only probe of NSE's older delivery files (the MTO
   archive) runs during the F2 build. If they reach 2013, delivery becomes a separately
   pre-registered F3.
+  - **Probe result, 2026-10-14: they do.**
+    - `archives.nseindia.com/archives/equities/mto/MTO_DDMMYYYY.DAT` returned files for
+      2013-01-02, 2015-06-01, 2017-06-01, 2018-06-01 and 2020-06-02, in one format
+      throughout: symbol, series, quantity traded, deliverable quantity and delivery %.
+    - Only those five files were fetched.
+    - F3 is feasible. It needs its own pre-registration and its own N, and it stays outside
+      this grid.
 
 ### B.8 · Deviations and clarifications log
 
@@ -465,3 +472,24 @@ on returns. Every deviation, and every point where the implementation had to set
     Realty for 35% of the universe in mid-2016, and Energy and Media for 34% and 22% in 2025.
   - For those names the sector features measure "which part of the market it moves with". This
     is the §B rule working as written, so it is reported here and not changed.
+- **2026-10-14 · B.2, F2 readings (Stage 4, clarifications).** These were settled from the
+  archive's format alone. No return was computed against any target.
+  - **Options traded value** is NSE's reported value. In both archive eras that is
+    **notional**, (strike + premium) × quantity: legacy `VAL_INLAKH` × 1e5, UDiFF
+    `TtlTrfVal`, checked against INFY rows. Premium-only value cannot be formed, because
+    the legacy files carry no lot size.
+    - `opt_volratio_5b` is 0 on a day the stock had F&O but no option traded.
+    - It is NaN on a day the stock had no F&O.
+  - **The forward F** is the near-month future's close only if that future traded that day.
+    Otherwise the stock has no IV features that day.
+  - **The IV filter** also drops prices at or above the no-arbitrage ceiling (discounted F
+    for calls, discounted K for puts), and roots outside σ ∈ [0.001, 5].
+  - **5- and 20-bar windows** (`opt_iv_chg_5b`, the realized vol in `opt_iv_rv`,
+    `opt_volratio_5b`, `fut_oi_chg_5b`) count the stock's own bars, as in F1. A window
+    with no stated minimum needs to be complete.
+  - **`fut_basis`** uses the raw spot, the panel close divided by `adj_factor`, since
+    futures trade on unadjusted prices. Its median is taken over the engine's tickers that
+    have a basis that day. The raw annualized basis has a median of 6.5%, the rate it
+    removes.
+  - **Open interest** is divided by that day's `adj_factor`, as the panel does for volume,
+    so a split does not register as a jump in OI.

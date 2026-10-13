@@ -16,4 +16,11 @@ F1 (price and index) build order:
     market.py           index                -> data/phase6/f1/market.parquet
 
     python src/phase6_features/build_f1.py --build      # all of the above, in order
+
+F2 (options and futures) build order:
+    fo_archive.py       F&O archive          -> data/phase6/fo_stock_long.parquet
+    options.py          fo table + panel     -> data/phase6/f2/opt_*.parquet
+    futures.py          fo table + panel     -> data/phase6/f2/fut_*.parquet
+
+    python src/phase6_features/build_f2.py --build      # all of the above, in order
 """

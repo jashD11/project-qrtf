@@ -11,8 +11,8 @@
   bit-identical, and worth 3% of IC at 5b and 13% at 21b.
 
 **Not done**
-- Stages 4–9. Stages 0–3 are complete: §B is pre-registered and committed, monthly
-  rebalancing is built and verified, and the F1 panels are built (2026-10-14).
+- Stages 5–9. Stages 0–4 are complete: §B is pre-registered and committed, monthly
+  rebalancing is built and verified, and the F1 and F2 panels are built (2026-10-14).
 - The purged ensemble re-score of the Phase 5 grid was started and then paused. Stage 7's F0
   fits replace it.
 - This plan is a draft. The user reviewed it but interrupted approval to deal with machine
@@ -44,7 +44,7 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** start at Stage 4 (F2 options and futures features), then Stages 5–6, then Stage 7
+**Resume:** start at Stage 5 (wiring), then Stage 6, then Stage 7
 on a night with a suitable charger or with lowered `rf.n_jobs`.
 
 ## Context
@@ -181,7 +181,19 @@ date, so ranking would flatten it to a constant. It enters the model raw, lettin
 learn interactions, which is the GKX role of macro predictors. `feature_creator` gets a
 separate unranked family for it.
 
-## Stage 4 — F2 features: options and futures (`src/phase6_features/options.py`, `futures.py`)
+## Stage 4 — F2 features: options and futures (`src/phase6_features/options.py`, `futures.py`): DONE (2026-10-14)
+
+Built with `python src/phase6_features/build_f2.py --build`: `fo_archive` (3,092 sessions →
+`data/phase6/fo_stock_long.parquet`, 1.6M futures rows and 18.7M traded option rows), then
+`options` and `futures` → `data/phase6/f2/*.parquet`. Results:
+- All 28 dry-run checks pass.
+- IV was solved for 96.7% of near-month traded options.
+- The daily median stock ATM IV tracks India VIX at a correlation of 0.88, at about twice
+  its level.
+- Options are available on 25–44% of universe cells, depending on the year.
+- The readings are logged in §B.8. The MTO delivery probe was positive (it reaches 2013);
+  see §B.7.
+- Logs are in `data/phase6/logs/stage4_*`.
 
 Both builders read `data/bhavcopy/fo` (legacy format) and `fo_udiff` (UDiFF format).
 Symbols are mapped to panel tickers with the mapping already in
