@@ -11,8 +11,8 @@
   bit-identical, and worth 3% of IC at 5b and 13% at 21b.
 
 **Not done**
-- Stages 3–9. Stages 0–2 are complete: §B is pre-registered and committed, and monthly
-  rebalancing is built and verified (2026-10-14).
+- Stages 4–9. Stages 0–3 are complete: §B is pre-registered and committed, monthly
+  rebalancing is built and verified, and the F1 panels are built (2026-10-14).
 - The purged ensemble re-score of the Phase 5 grid was started and then paused. Stage 7's F0
   fits replace it.
 - This plan is a draft. The user reviewed it but interrupted approval to deal with machine
@@ -44,7 +44,7 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** start at Stage 3 (F1 price and index features), then Stages 4–6, then Stage 7
+**Resume:** start at Stage 4 (F2 options and futures features), then Stages 5–6, then Stage 7
 on a night with a suitable charger or with lowered `rf.n_jobs`.
 
 ## Context
@@ -143,7 +143,17 @@ rebalance checks, and all 58 checks pass. `no_lookahead_check.py` gained a
     - a forced exit still trades between rebalances;
     - the book stays dollar-neutral for `_slb`.
 
-## Stage 3 — F1 features: price and index additions (`src/phase6_features/`)
+## Stage 3 — F1 features: price and index additions (`src/phase6_features/`): DONE (2026-10-14)
+
+Built with `python src/phase6_features/build_f1.py --build`, which writes
+`data/phase6/index_daily.parquet` and `data/phase6/f1/*.parquet`. There are four modules:
+`index_series`, `price_features`, `sector` and `market`. Results:
+- All 37 dry-run checks pass. They include exact OLS across a halt, recovery of planted
+  sectors, and future-perturbation causality.
+- Every feature covers 99.3–99.9% of universe cells in every year from 2014.
+- Data decisions (missing index days, long P/E blanks, the 2021-03-31 P/E splice) are
+  logged in §B.8.
+- Logs are in `data/phase6/logs/stage3_*`.
 
 New package, modelled on `src/phase4_data/`: one builder per family, each writing a
 `(date × ticker)` Parquet under `data/phase6/`, each with `--build` and a dry-run. **Every

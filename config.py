@@ -471,6 +471,15 @@ PHASE5_IC_WINDOW: int = 252               # M2: trailing observations for the ca
 PHASE5_IC_MIN_OBS: int = 126              # M2: below this, behave as the baseline buffer
 
 
+# --------------------------------------------------------------------------- #
+# Phase 6 Part B — pre-registered in docs/phase6_plan.md §B.
+#
+# The holdout is every session after this date. It stays sealed until §B.5's single
+# holdout step: Part B builders refuse inputs past it unless told otherwise.
+# --------------------------------------------------------------------------- #
+PHASE6_SEALED_AFTER: str = "2025-06-30"
+
+
 @dataclass
 class StrategyConfig:
     is_simulation: bool

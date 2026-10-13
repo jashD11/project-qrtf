@@ -422,3 +422,46 @@ on returns. Every deviation, and every point where the implementation had to set
     leg has drained is net long, so it breaks the dollar-neutrality that B.4's checks require.
   - **The participation cap** is likewise set on the rebalance bar and held with the book.
     Re-capping on each day's ADV would re-weight a held book between rebalances.
+- **2026-10-14 · B.2, F1 data quality (Stage 3, deviations).** Found while building, from the
+  index archive alone. No return was computed against any target.
+  - **Missing index sessions.** 12 panel sessions have no index file (2013-10-09 …
+    2016-06-20). Index levels and valuations carry the previous session forward. The move
+    lands on the next published session.
+  - **Long P/E blanks are treated as losses, not forward-filled indefinitely.** NSE leaves P/E
+    blank when a sector's aggregate earnings are not positive: PSU Bank 2016-05 → 2017-05 and
+    2018-02 → 2021-01, Media 2020-08 → 2021-11 and 2022-09 → 2025-05. Forward-filling those
+    would carry a P/E that is years stale.
+    - A gap of up to 63 sessions is a publication pause and is carried. The FY-end gap of
+      2021-03-31 → 2021-06-02 in Bank and PSU Bank dividend yield, and in Realty P/E, is one.
+    - A P/E still blank after 63 sessions becomes +inf: above every finite P/E, which is the
+      earnings-yield ordering.
+    - This is causal: a run counts as a loss only once it has lasted past the limit.
+    - It affects 7.1% of universe cells on average, and at most 30.2%.
+  - **Nifty 50 P/E is spliced at 2021-03-31.** NSE switched index P/E from standalone to
+    consolidated earnings that day. The Nifty 50 P/E fell 18% (40.43 → 33.20) on an index move
+    under 1%: a net jump of 0.187 in logs, against at most 0.082 on any other session.
+    - The history before the break is scaled by that day's P/E move net of the index move.
+    - A constant scale leaves every expanding z-score before the break unchanged. From the
+      break on, the scale is known at that day's close.
+    - Sector P/E is not spliced: it is only ever ranked within a date.
+- **2026-10-14 · B.2, F1 readings (Stage 3, clarifications).**
+  - **Own bars.** Windows count each stock's own trading bars, as the 17 existing features do.
+    An index return paired with a stock return is taken over the stock's own bar span, so a
+    return across a halt is compared with the market move over that halt.
+  - **Complete windows.** A window with no stated minimum needs to be complete, as in
+    `feature_creator._roll`.
+  - **`ivol_63b`** is the residual stdev of the market model fitted on the trailing 63 bars
+    itself (n − 2 degrees of freedom), not residuals from the 252-bar beta.
+  - **Market z-scores** are computed on the archive's own sessions, then carried onto the panel
+    calendar.
+  - **Sector features** exist only on cells where the stock traded.
+- **2026-10-14 · Observed, not changed: what the sector assignment means for small caps.**
+  - Names with an obvious sector are assigned correctly: HDFC Bank and ICICI Bank to Financial
+    Services or Bank, SBI and PNB to PSU Bank, Infosys and TCS to IT, Sun Pharma to Pharma,
+    Tata Steel to Metal, DLF to Realty, Maruti to Auto, HUL and ITC to FMCG, ONGC and Reliance
+    to Energy, Zee to Media.
+  - Mid and small caps in industries without one of the 11 indexes (chemicals, capital goods,
+    cement and the like) take whichever index best tracks broad small-cap moves. That was
+    Realty for 35% of the universe in mid-2016, and Energy and Media for 34% and 22% in 2025.
+  - For those names the sector features measure "which part of the market it moves with". This
+    is the §B rule working as written, so it is reported here and not changed.
