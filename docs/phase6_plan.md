@@ -1,6 +1,8 @@
 # Phase 6 plan: why the signal decays, then a better signal
 
-Status: **Part A pre-registered** (2026-10-06). Part B is not yet planned.
+Status: **Part A pre-registered** (2026-10-06) and run (results:
+[`phase6_decay_results.md`](phase6_decay_results.md)). **Part B pre-registered** (2026-10-14).
+Execution plan: [`phase6_partB_plan_draft.md`](phase6_partB_plan_draft.md).
 Idea note: [`phase6_idea.md`](phase6_idea.md).
 
 ---
@@ -211,6 +213,201 @@ answering a question about the walk-forward.
 
 ---
 
-## B · Find a better signal
+## B · Pre-registration: new information, cheaper trading (N 42 → 57)
 
-Not yet planned. Written after Part A's result, as its own pre-registration.
+**Committed before anything in it is built, and before any return is computed on a new
+feature.** Everything in this section is frozen. The execution steps are in
+[`phase6_partB_plan_draft.md`](phase6_partB_plan_draft.md).
+
+### B.0 · Why
+
+Part A fired no rule. Its evidence still says the information in the 17 price features is
+fading, the low-volatility family above all, and that no model rescues it. A model fitted
+inside each year, with that year's future, finds no IC in 2024–25. Part B therefore changes
+the **information**, not the model, and adds a **cheaper way to trade**: a monthly rebalance
+for the 21b label. Under §A.6, anything Part B takes from Part A is in-sample for 2021–25 and
+is judged on the sealed holdout.
+
+### B.1 · Scope and what is held fixed
+
+- **Data.** The frozen panel ends 2025-06-30, and the holdout after that stays sealed until
+  B.5's holdout step. **No file dated after 2025-06-30 is downloaded or read before then.**
+  Every Part B builder asserts this on its inputs.
+- **The in-sample OOS window** is the Phase 5 ledger's: 2016-01-21 → 2025-06-27. Every cell is
+  scored on exactly this date range. The run asserts it.
+- **Held fixed from Phase 5 in every cell:**
+  - universe `daily_nse500`;
+  - the ensemble, with walk-forward 504/63;
+  - `decile_pct = 0.10`, `rebalance_buffer_mult = 2.0`, `hmm_states = 2`;
+  - the Phase 4c cost regime: `aum_rupees = 1e7`, `max_participation = 0.10`, spread
+    estimator `cs`, impact on, SLB eligibility on the `_slb` styles;
+  - construction **`cost_swap`** (M2), with κ = 1.0, IC window 252 and minimum 126 as in
+    `PHASE5_*`;
+  - the label-overlap purge (§A.7), on in every fit.
+- **Nothing here is tuned.** κ, windows, thresholds and the definitions in B.2 are not
+  revisited after any Part B number is seen.
+
+### B.2 · Feature sets
+
+There are three sets. Each contains the one before it, so each layer's marginal value can be
+read off.
+
+- **F0 `p17`:** today's 17 price features, unchanged.
+- **F1 `p17x`:** F0 plus the price and index features below.
+- **F2 `p17xo`:** F1 plus the options and futures features below.
+
+**Common rules.**
+- Every value on date t uses only data at or before the close of t, the convention of the
+  existing features.
+- Per-stock features are rank-normalized per date to [-1, +1], as today.
+- Prices are split- and bonus-adjusted (`adj_factor`) wherever two dates' prices meet in one
+  formula.
+
+**F1: price and index features.**
+
+| feature | definition |
+|---|---|
+| `beta_252b` | OLS slope of the stock's daily log return on the Nifty 500's, over the trailing 252 bars ending at t (minimum 126) |
+| `ivol_63b` | stdev of the residuals of the same regression over the trailing 63 bars (minimum 42) |
+| `ret_overnight_21b` | sum over the trailing 21 bars of log(open_t / close_t−1) |
+| `ret_intraday_21b` | sum over the trailing 21 bars of log(close_t / open_t) |
+| `trade_size_21b` | median over the trailing 21 bars of turnover / trades, on bars with trades > 0 |
+| `spread_cs_63b` | the existing Corwin-Schultz half-spread panel (`spread_daily_cs.parquet`, window ends t−1) |
+| `sector_mom_63b` | the assigned sector index's 63-bar log return |
+| `sector_rel_21b` | the stock's 21-bar log return minus its assigned sector index's |
+| `sector_pe`, `sector_pb`, `sector_dy` | the assigned sector index's P/E, P/B and dividend yield (`-` read as missing, forward-filled per index) |
+| `mkt_vix_z` | India VIX close, as an expanding z-score |
+| `mkt_pe_z` | Nifty 50 P/E, as an expanding z-score |
+| `mkt_ret_21b` | Nifty 50 21-bar log return |
+
+- **Sector assignment.** The candidate set is the 11 sectoral indexes present continuously
+  since 2013: Auto, Bank, Energy, Financial Services, FMCG, IT, Media, Metal, Pharma, PSU Bank
+  and Realty. They were renamed from "CNX …" to "Nifty …" in November 2015, and a fixed name
+  map joins the two. Each stock is assigned the index whose daily log returns it correlates
+  with most over the trailing 252 bars (minimum 126). Assignment is redone on the universe
+  rebalance dates (`universe.rebalance_dates`, every 63 bars) and held in between. It needs no
+  constituent list and has no survivorship bias.
+- **Market-wide features (`mkt_*`) are not rank-normalized.** They are identical across stocks
+  on a date, so ranking would make them a constant. They enter raw, letting the trees learn
+  interactions.
+- **Expanding z-scores need at least 252 observations. Before that the value is 0**, the
+  z-score's mean. India VIX starts on 2014-05-14 in the index archive, so the earliest
+  training folds see a constant 0 for `mkt_vix_z`.
+
+**F2: options and futures features.**
+
+Sources: `data/bhavcopy/fo` (legacy, 2013-01 → 2024-06) and `data/bhavcopy/fo_udiff`
+(2024-07 → 2025-06). Symbols map to panel tickers through the `shortable.py` mapping.
+
+Rules applied before anything is computed:
+- **Expiry.** Use the near-month expiry, rolling to the next month when fewer than 7 calendar
+  days remain.
+- **Traded contracts only** (contracts > 0). Untraded strikes carry NSE's theoretical
+  settlement price.
+- **IV by Black-76:**
+  - the forward F is the same-expiry stock-futures close;
+  - the rate is fixed at 6.5%;
+  - the solver is vectorized bisection;
+  - prices at or below intrinsic value are dropped.
+
+| feature | definition |
+|---|---|
+| `opt_atm_iv` | IV interpolated linearly in strike between the two traded strikes bracketing F. At each strike, take the mean of call and put IV where both traded, otherwise whichever traded |
+| `opt_ivspread` | mean of (call IV − put IV) over strikes within ±10% of F where both traded |
+| `opt_skew` | IV of the traded put whose K/F is nearest 0.90 (within 0.85–0.95), minus `opt_atm_iv` |
+| `opt_iv_chg_5b` | `opt_atm_iv`_t − `opt_atm_iv`_t−5 |
+| `opt_iv_rv` | `opt_atm_iv` minus the 20-bar realized vol (stdev of daily log returns × √252) |
+| `opt_volratio_5b` | 5-bar mean of the stock's total options traded value (all strikes and expiries) / its rupee turnover |
+| `fut_basis` | near-month log(F/S) × 365 / days to expiry, minus the date's cross-sectional median |
+| `fut_oi_chg_5b` | log(OI_t / OI_t−5), with stock-futures open interest summed over expiries |
+| `opt_avail` | 1 if `opt_atm_iv` exists for the name on t, else 0 (raw, not ranked) |
+
+- **Names without options.** About 60% of the universe has none on a given day. F2 features are
+  rank-normalized among the names that have them. Every other name gets 0, the midpoint of the
+  band, and `opt_avail` = 0 tells the trees.
+- **Row-drop rule.** The rule changes from "every feature present" to "every *required*
+  feature present". F0 and F1 are required. F2 is optional.
+- **F0 stays byte-identical.** Under `p17`, `feature_creator` output and every wf_cache key are
+  unchanged.
+
+### B.3 · The grid and N
+
+- **The cells.** {F0, F1, F2} × {5b traded daily, 21b rebalanced every 21 bars} ×
+  {`long_only`, `long_short_slb`, `dynamic_tilt_slb`} = **18 cells**.
+- **The 21b rebalance.**
+  - Target weights are recomputed only on every 21st bar, counted from the first OOS bar, and
+    held in between.
+  - Forced exits still trade on any bar: a name leaving the universe, or a short losing its
+    borrow.
+  - The panic gate stays daily.
+  - The M2 swap decision runs on rebalance bars only.
+- **Strategy ids.** New fields are hashed only when not at their default, so every older id is
+  unchanged:
+  - `feature_set`: `_FX` for F1, `_FXO` for F2;
+  - `rebalance_every`: `_R21`;
+  - the purge keeps its `_PG` tag.
+- **N.** F0/5b holds the leak-fixed versions of the 3 Phase 5 `cost_swap` 5b cells. A
+  correction applied uniformly to already-searched cells counts 0, as the Phase 4c corrections
+  did. F0/21b is new, because Phase 5's 21b cells traded daily, and so are all 12 F1 and F2
+  cells. **N goes from 42 to 57.** This line enters `config.TRIAL_LEDGER` before the run:
+  `("phase6 Part B, 3 feature sets x 2 cadences x 3 styles, cost_swap", 15, "18 cells; F0/5b
+  are the 3 phase5 cost_swap 5b cells leak-fixed, a uniform correction counting 0")`.
+- **The ledger** is `data/trial_database/phase6/phase6_dsr_matrix.parquet`.
+
+### B.4 · Before the run: causality and quality gates
+
+None of these gates computes a return.
+- **Causality.** Perturb every raw input after a cut date D: prices, F&O files and index
+  files. Every feature on dates ≤ D, and every Tier 1 prediction on dates ≤ D, must come back
+  bit-identical. A planted canary (one feature shifted a day early) must be caught.
+- **Quality.** Report, per feature, coverage by year and NaN rate. Also report the share of
+  names with `opt_avail`, the median `opt_atm_iv` against India VIX, the IV solver failure
+  rate, and the `fut_basis` distribution.
+- **Regression.** With the new fields at their defaults, the Phase 5 ledger reproduces
+  bit-for-bit (`scripts/regression_check.py`), and `scripts/no_lookahead_check.py` passes.
+
+### B.5 · Criteria
+
+- **Headline.** A cell passes if its DSR is > 0.95 at **N = 57** over the B.1 window. The
+  scoring is that of every phase since 4c: compounded to daily, with the Lo variance-ratio
+  correction at 21 days. SR\* at N = 57 is about 1.23.
+- **Secondary, all reported.** Δ net Sharpe from F0 to F1 and from F1 to F2 in every cell: 12
+  numbers. None is selected or promoted.
+- **Read-only.** Per-feature IC by year for every new feature, using `per_feature_ic` and
+  `by_year` from `scripts/phase6_decay.py`. Reported, never selected on.
+- **Holdout, scored once.** The holdout runs from 2025-07-01 to the latest date available at
+  that step.
+  - First, the extended build must reproduce the frozen in-sample alpha ranks on dates ≤
+    2025-06-30, with daily rank-correlation ≥ 0.999. Back-adjustment for new corporate actions
+    rules out bit-identity.
+  - Then all 18 cells are scored. A cell **survives** if all three hold on the holdout: net
+    Sharpe > 0; net Sharpe ≥ ½ its in-sample net Sharpe; and ensemble IC against its own label
+    with Newey-West t ≥ 2 (lag h − 1, as in §A.2).
+  - The holdout can catch a collapse but cannot confirm a 1.8 Sharpe. Over about a year its
+    standard error is about 0.9.
+- **Part B succeeds** only for a cell that passes the headline **and** survives the holdout.
+
+### B.6 · Stop rule
+
+If no cell both passes and survives, the program stops adding features derived from price,
+index or options data. The only next step left is genuinely new data (delivery, B.7), under
+its own pre-registration.
+
+### B.7 · What Part B does not license, and what is parked
+
+- No κ, window, threshold or feature-definition change after a Part B number is seen.
+- **A cell added after Part B's results are read is selection, not a test.** Two Part A
+  candidates are parked, not dropped: a 1b horizon (where the reversal family held) and a
+  longer-memory learner (1008-day window). Either can enter only through its own later
+  pre-registration, with its own N.
+- **Delivery data** is deferred. The known archive starts in 2020, which is too short for a
+  504-day window plus a holdout. A read-only probe of NSE's older delivery files (the MTO
+  archive) runs during the F2 build. If they reach 2013, delivery becomes a separately
+  pre-registered F3.
+
+### B.8 · Deviations log
+
+Implementation may deviate from B.2 only for data-quality reasons, never for a reason based
+on returns. Every deviation is logged here with its date and reason before the run.
+
+*(none yet)*

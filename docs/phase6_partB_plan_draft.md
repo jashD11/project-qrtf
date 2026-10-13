@@ -1,4 +1,4 @@
-# Phase 6 Part B — execution plan (DRAFT, not yet approved or pre-registered)
+# Phase 6 Part B — execution plan (approved 2026-10-14; pre-registered in `phase6_plan.md` §B)
 
 ## Handoff — read this first (state as of 2026-10-07)
 
@@ -11,7 +11,7 @@
   bit-identical, and worth 3% of IC at 5b and 13% at 21b.
 
 **Not done**
-- Everything in this plan. Stage 0 (commit) is complete.
+- Stages 2–9. Stages 0 and 1 are complete: §B is pre-registered and committed (2026-10-14).
 - The purged ensemble re-score of the Phase 5 grid was started and then paused. Stage 7's F0
   fits replace it.
 - This plan is a draft. The user reviewed it but interrupted approval to deal with machine
@@ -25,6 +25,11 @@
 - **M2 (`cost_swap`)** is the construction.
 - The Phase 4c cost regime stays on.
 - The purge is on for every Phase 6 fit.
+- (2026-10-14) Part A's 1b and longer-memory cells stay **out** of the grid for now and are
+  parked under "Deferred, not dropped".
+- (2026-10-14) How to power Stage 7 (charger vs lower `rf.n_jobs`) is **decided at Stage 7**.
+- (2026-10-14) The user **approved** the draft. Stage 1 (§B in `docs/phase6_plan.md`) is
+  committed. §B is now the binding text. Where it is more specific than this plan, §B wins.
 
 **Machine constraints (measured 2026-10-07; MacBook Pro M1 Pro, 8 cores, 16 GB)**
 - Measured: whole-Mac draw is about **32 W** with `rf.n_jobs = 6`, against about 5.5 W idle.
@@ -38,8 +43,8 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** start at Stage 1 (pre-register §B in `docs/phase6_plan.md`, commit it), then
-Stages 2–6, then Stage 7 on a night with a suitable charger or with lowered `rf.n_jobs`.
+**Resume:** start at Stage 2 (monthly rebalancing in Tier 3), then Stages 3–6, then Stage 7
+on a night with a suitable charger or with lowered `rf.n_jobs`.
 
 ## Context
 
@@ -69,7 +74,7 @@ Decisions agreed with the user:
 
 Part A, the purge fix with §A.7, and this draft were committed. Nothing is left uncommitted except gitignored data and `CLAUDE.md`.
 
-## Stage 1 — pre-register Part B (`docs/phase6_plan.md` §B), committed before building
+## Stage 1 — pre-register Part B (`docs/phase6_plan.md` §B): DONE (2026-10-14)
 
 The §B text freezes six things before anything is built.
 
@@ -268,6 +273,19 @@ universe.
 504-day window and still test on the holdout. Stage 4 includes a read-only probe of NSE's
 older delivery files (the MTO archive). If they reach 2013, delivery becomes a separately
 pre-registered F3.
+
+**Part A's two candidate cells** (`phase6_decay_results.md` §3). On 2026-10-14 the user chose
+not to add them to the 18-cell grid yet, but to keep them for later:
+- **A 1b horizon.** It matches the reversal family that held up: the frozen composite holds at
+  IC ≈ 0.055 through 2025. The risk is 1b turnover, which was fatal on costs before M2.
+- **A longer-memory or more heavily regularised learner**, e.g. a 1008-day training window.
+  It beat 504 recently (0.023 vs 0.013). It cuts against the "keep 504/63" decision, so it
+  would also blur whether any gain came from the features.
+
+Both ideas come from the 2021–25 data, so they are in-sample. If either is taken up, it must be
+added to §B **before Stage 7 produces any number**, with its cells counted in N. Otherwise it
+needs its own later pre-registration. Adding a cell after Part B's results are seen is the
+selection bias the DSR gate exists to correct.
 
 ## Verification summary
 
