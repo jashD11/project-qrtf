@@ -296,8 +296,11 @@ TRIAL_LEDGER: list[tuple[str, int, str]] = [
     ("phase6 Part A decay diagnostics (per-learner, ridge, ceiling, window probe)", 0,
      "read-only, never promoted; any Part B use is judged on the sealed post-2025-06 "
      "holdout with its own N (docs/phase6_plan.md §A.1, §A.6)"),
+    ("phase6 Part B, 3 feature sets x 2 cadences x 3 styles, cost_swap", 15,
+     "18 cells; F0/5b are the 3 phase5 cost_swap 5b cells leak-fixed, a uniform "
+     "correction counting 0 (docs/phase6_plan.md §B.3)"),
 ]
-TRIALS_SEARCHED: int = sum(n for _, n, _ in TRIAL_LEDGER)   # = 42
+TRIALS_SEARCHED: int = sum(n for _, n, _ in TRIAL_LEDGER)   # = 57
 
 
 @dataclass
@@ -479,6 +482,17 @@ PHASE5_IC_MIN_OBS: int = 126              # M2: below this, behave as the baseli
 # --------------------------------------------------------------------------- #
 PHASE6_SEALED_AFTER: str = "2025-06-30"
 
+# The frozen grid (§B.3): feature set x (target, cadence) x style, all M2 under the
+# Phase 4c cost regime with the label-overlap purge on. The target fixes the cadence:
+# the 5b label trades daily, the 21b label rebalances every 21 bars. 18 cells; the
+# TRIAL_LEDGER line above charges the 15 new ones (N 42 -> 57).
+PHASE6_FREQUENCY: str = "daily_nse500"
+PHASE6_FEATURE_SETS: list[str] = ["p17", "p17x", "p17xo"]
+PHASE6_CADENCE: dict[str, int] = {"tgt_fwd_logret_5b": 1, "tgt_fwd_logret_21b": 21}
+PHASE6_STYLES: list[str] = ["long_only", "long_short_slb", "dynamic_tilt_slb"]
+PHASE6_CONSTRUCTION: str = "cost_swap"
+PHASE6_LEDGER: str = "data/trial_database/phase6/phase6_dsr_matrix.parquet"
+
 
 @dataclass
 class StrategyConfig:
@@ -523,6 +537,11 @@ class StrategyConfig:
                               # between, except for forced exits (a name leaves the
                               # universe, or a short loses its borrow). 1 = every bar,
                               # the pre-Phase-6 path. Hashed (tag _R<N>) only when != 1.
+    feature_set: str = "p17"  # Phase 6 Part B (docs/phase6_plan.md §B.2): "p17" = the 17
+                              # price features; "p17x" adds the F1 price/index set,
+                              # "p17xo" also the F2 options/futures set. A different
+                              # input set is a different strategy. Hashed (tags _FX /
+                              # _FXO) only when not "p17".
 
     @property
     def strategy_id(self) -> str:
@@ -552,6 +571,10 @@ class StrategyConfig:
             prefix += "_PG"
         if self.rebalance_every != 1:
             prefix += f"_R{self.rebalance_every}"
+        if self.feature_set != "p17":
+            prefix += "_" + {"p17x": "FX", "p17xo": "FXO"}.get(
+                self.feature_set, self.feature_set.upper()
+            )
 
         # All parameters included so every distinct permutation hashes uniquely
         param_string: str = (
@@ -568,6 +591,8 @@ class StrategyConfig:
             param_string += "_purge"
         if self.rebalance_every != 1:
             param_string += f"_rebal{self.rebalance_every}"
+        if self.feature_set != "p17":
+            param_string += f"_{self.feature_set}"
         param_hash: str = hashlib.md5(param_string.encode()).hexdigest()[:8]
 
         return f"{prefix}_{param_hash}"

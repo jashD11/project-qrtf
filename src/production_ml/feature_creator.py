@@ -122,6 +122,12 @@ INSTITUTIONAL_FEATURE_COLUMNS: Final[list[str]] = [
 # trailing two when delivery data is unavailable for the chosen frequency.
 FEATURE_COLUMNS: Final[list[str]] = PRICE_FEATURE_COLUMNS + INSTITUTIONAL_FEATURE_COLUMNS
 TARGET_COLUMNS: Final[list[str]] = [f"tgt_fwd_logret_{h}b" for h in TARGET_HORIZONS]
+# The date each label is realised: the name's own bar h steps ahead. Emitted only on
+# request (``label_end_dates``), for the Tier 1 label-overlap purge. A label counts
+# OWN bars, so across a halt it ends later than h calendar bars on; a purge that
+# counted calendar bars let 0.02% of training labels reach the scored block
+# (docs/phase6_plan.md §B.8, Stage 6).
+TARGET_END_COLUMNS: Final[list[str]] = [f"tgt_end_{h}b" for h in TARGET_HORIZONS]
 
 
 def feature_columns(with_institutional: bool = True) -> list[str]:
@@ -133,9 +139,115 @@ def feature_columns(with_institutional: bool = True) -> list[str]:
     )
 
 
+# --- Phase 6 Part B feature sets (docs/phase6_plan.md §B.2) ---------------- #
+# Built by src/phase6_features/ as raw wide (date × ticker) Parquets and read here as
+# plain files, so this package does not import that one. Three treatments:
+#   ranked    per-stock, rank-normalized per date among in-universe names, like the 17;
+#   market    one value per date for every stock, so entered raw (ranking would make
+#             it a constant);
+#   optional  options / futures (F2): ranked among the names that have them, 0 (the
+#             band's midpoint) for the rest, with ``opt_avail`` (raw 0/1) telling the
+#             trees which is which. Optional features never drop a row.
+F1_RANKED: Final[list[str]] = [
+    "beta_252b", "ivol_63b", "ret_overnight_21b", "ret_intraday_21b", "trade_size_21b",
+    "spread_cs_63b", "sector_mom_63b", "sector_rel_21b", "sector_pe", "sector_pb",
+    "sector_dy",
+]
+F1_MARKET: Final[list[str]] = ["mkt_vix_z", "mkt_pe_z", "mkt_ret_21b"]
+F2_OPTIONAL: Final[list[str]] = [
+    "opt_ivspread", "opt_skew", "opt_atm_iv", "opt_iv_chg_5b", "opt_iv_rv",
+    "opt_volratio_5b", "fut_basis", "fut_oi_chg_5b",
+]
+F2_FLAG: Final[list[str]] = ["opt_avail"]
+FEATURE_SETS: Final[dict[str, list[str]]] = {
+    "p17": [],
+    "p17x": F1_RANKED + F1_MARKET,
+    "p17xo": F1_RANKED + F1_MARKET + F2_OPTIONAL + F2_FLAG,
+}
+EXTRA_FEATURE_COLUMNS: Final[list[str]] = FEATURE_SETS["p17xo"]
+PHASE6_PANEL_DIRS: Final[dict[str, str]] = {"f1": "data/phase6/f1", "f2": "data/phase6/f2"}
+PHASE6_MARKET_PARQUET: Final[str] = "data/phase6/f1/market.parquet"
+
+
 def present_feature_columns(df: pd.DataFrame) -> list[str]:
-    """The subset of the feature schema actually present as columns on ``df``."""
-    return [c for c in FEATURE_COLUMNS if c in df.columns]
+    """
+    The subset of the feature schema actually present as columns on ``df``.
+
+    The Phase 6 columns follow the 17 (or 19), so a ``p17`` frame resolves exactly as
+    before, and so does every cache key built from this list.
+    """
+    return [c for c in FEATURE_COLUMNS + EXTRA_FEATURE_COLUMNS if c in df.columns]
+
+
+def load_phase6_panels(feature_set: str) -> dict[str, pd.DataFrame]:
+    """
+    Read the raw panels a Phase 6 feature set needs. Per-stock panels are wide
+    (date × ticker); the market panel is one (date × 3) frame under key ``"market"``.
+    """
+    names = FEATURE_SETS[feature_set]
+    out: dict[str, pd.DataFrame] = {}
+    for name in names:
+        if name in F1_MARKET:
+            continue
+        sub = "f1" if name in F1_RANKED else "f2"
+        path = os.path.join(PHASE6_PANEL_DIRS[sub], f"{name}.parquet")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"{path} not found — run `python src/phase6_features/build_{sub}.py --build`."
+            )
+        out[name] = pd.read_parquet(path)
+    if any(n in F1_MARKET for n in names):
+        if not os.path.exists(PHASE6_MARKET_PARQUET):
+            raise FileNotFoundError(
+                f"{PHASE6_MARKET_PARQUET} not found — run "
+                "`python src/phase6_features/build_f1.py --build`."
+            )
+        out["market"] = pd.read_parquet(PHASE6_MARKET_PARQUET)
+    for frame in out.values():
+        frame.index = pd.DatetimeIndex(frame.index).normalize()
+    return out
+
+
+def _phase6_features(
+    index: pd.MultiIndex,
+    feature_set: str,
+    universe_mask: pd.DataFrame | None,
+    panels: dict[str, pd.DataFrame],
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    The Phase 6 columns for ``index`` (the bar frame's rows), and which are required.
+
+    Required = every ranked F1 and market column: a row missing one is dropped, as for
+    the 17. F2 is optional and filled, so it never removes a row.
+    """
+    names = FEATURE_SETS[feature_set]
+
+    def _long(wide: pd.DataFrame) -> pd.Series:
+        s = wide.rename_axis(index=DATE_LEVEL, columns=TICKER_LEVEL).stack(future_stack=True)
+        return s.reindex(index)
+
+    ranked = [n for n in names if n in F1_RANKED or n in F2_OPTIONAL]
+    raw = pd.DataFrame({n: _long(panels[n]) for n in ranked}, index=index)
+    if universe_mask is not None:
+        raw = _apply_universe_mask(raw, universe_mask)
+    # +inf (a loss-making sector's P/E, §B.8) is a value, not a gap: it ranks above
+    # every finite P/E. Only NaN is missing.
+    normed = _rank_normalize(raw)
+    optional = [n for n in ranked if n in F2_OPTIONAL]
+    if optional:
+        normed[optional] = normed[optional].fillna(0.0)
+
+    out = normed
+    if any(n in F2_FLAG for n in names):
+        out["opt_avail"] = _long(panels["opt_avail"]).fillna(0.0)
+    market = [n for n in names if n in F1_MARKET]
+    if market:
+        dates = index.get_level_values(DATE_LEVEL)
+        m = panels["market"][market].reindex(pd.DatetimeIndex(dates).normalize())
+        for n in market:
+            out[n] = m[n].to_numpy()
+    required = [n for n in names if n in F1_RANKED or n in F1_MARKET]
+    return out[names], required
 
 
 _PARKINSON_K: Final[float] = 1.0 / (4.0 * np.log(2.0))  # Parkinson variance scalar
@@ -334,6 +446,9 @@ def create_features(
     augmented_df: pd.DataFrame,
     frequency: str = config.DEFAULT_FREQUENCY,
     universe_mask: pd.DataFrame | None = None,
+    feature_set: str = "p17",
+    phase6_panels: dict[str, pd.DataFrame] | None = None,
+    label_end_dates: bool = False,
 ) -> pd.DataFrame:
     """
     Build the normalized feature matrix + forward-return targets for one frequency.
@@ -352,6 +467,15 @@ def create_features(
             emitted rows — are restricted to that date's tradeable set. ``None``
             (the default) leaves behaviour byte-for-byte identical to Phase 2/3, so
             the published results stay reproducible.
+        feature_set: a key in ``FEATURE_SETS``. ``"p17"`` (the default) is the
+            pre-Phase-6 matrix, byte for byte. ``"p17x"`` / ``"p17xo"`` append the
+            Phase 6 columns (docs/phase6_plan.md §B.2) after the 17.
+        phase6_panels: the raw Phase 6 panels, as ``load_phase6_panels`` returns them.
+            Read from ``data/phase6/`` when None; passed in by the causality check,
+            which builds them from perturbed inputs.
+        label_end_dates: also emit ``TARGET_END_COLUMNS``, each label's realisation
+            date, after the targets. Off by default, so the matrix is unchanged; the
+            Tier 1 purge needs it on.
 
     Returns:
         MultiIndex ('date', 'ticker') DataFrame with the feature columns (19, or
@@ -382,9 +506,24 @@ def create_features(
         raw = _apply_universe_mask(raw, universe_mask)
     normed = _rank_normalize(raw)
     targets = _compute_targets(df, null_cross_session)
+    if label_end_dates:
+        stamp = pd.Series(df.index.get_level_values(DATE_LEVEL), index=df.index)
+        for h in TARGET_HORIZONS:
+            targets[f"tgt_end_{h}b"] = _shift(stamp, -h).where(
+                targets[f"tgt_fwd_logret_{h}b"].notna())
 
-    out = pd.concat([normed, targets], axis=1)
+    if feature_set not in FEATURE_SETS:
+        raise ValueError(f"feature_set={feature_set!r} not in {sorted(FEATURE_SETS)}")
     feat_cols = feature_columns(with_institutional)
+    if feature_set == "p17":
+        out = pd.concat([normed, targets], axis=1)
+    else:
+        panels = phase6_panels if phase6_panels is not None else load_phase6_panels(feature_set)
+        extra, required = _phase6_features(df.index, feature_set, universe_mask, panels)
+        out = pd.concat([normed, extra, targets], axis=1)
+        print(f"[feature_creator] feature_set={feature_set}: +{extra.shape[1]} Phase 6 "
+              f"columns ({len(required)} required, {extra.shape[1] - len(required)} optional)")
+        feat_cols = feat_cols + required
 
     before = len(out)
     # Require every feature (drops warm-up / inf-derived NaNs) and at least one
@@ -504,3 +643,71 @@ if __name__ == "__main__":
     print(f"  no NaN feature rows: {'PASS' if no_feat_nan else 'FAIL'}")
     print(f"  target NaN (masked): {tgt_nan}")
     print("=" * 70)
+
+    # --- Phase 6 feature sets (docs/phase6_plan.md §B.2) ------------------- #
+    checks: dict[str, bool] = {
+        "[-1, +1] bounds": bool(in_bounds),
+        "no NaN feature rows": bool(no_feat_nan),
+        "feature_set='p17' == default (byte-identical)": bool(
+            create_features(dummy, feature_set="p17").equals(matrix)
+        ),
+    }
+    rng6 = np.random.default_rng(6)
+    d6 = dummy.index.get_level_values(DATE_LEVEL).unique()
+    t6 = dummy.index.get_level_values(TICKER_LEVEL).unique()
+
+    def _wide6(fill: float | None = None) -> pd.DataFrame:
+        w = pd.DataFrame(rng6.normal(size=(len(d6), len(t6))), index=d6, columns=t6)
+        w.iloc[:30] = np.nan                                   # warm-up
+        return w
+
+    panels6 = {n: _wide6() for n in F1_RANKED + F2_OPTIONAL}
+    panels6["sector_pe"].iloc[30:, 0] = np.inf                 # a loss-making sector
+    panels6["beta_252b"].iloc[300:310, 2] = np.nan             # an F1 gap after warm-up
+    no_opt = list(t6[5:])                                      # half the names: no options
+    for n in F2_OPTIONAL:
+        panels6[n][no_opt] = np.nan
+    panels6["opt_avail"] = pd.DataFrame(1.0, index=d6, columns=t6)
+    panels6["opt_avail"][no_opt] = 0.0
+    panels6["market"] = pd.DataFrame(
+        {n: rng6.normal(size=len(d6)) for n in F1_MARKET}, index=d6)
+    m_x = create_features(dummy, feature_set="p17x", phase6_panels=panels6)
+    m_xo = create_features(dummy, feature_set="p17xo", phase6_panels=panels6)
+    checks["p17x adds the 14 F1 columns after the 17"] = bool(
+        list(m_x.columns) == FEATURE_COLUMNS + FEATURE_SETS["p17x"] + TARGET_COLUMNS)
+    checks["p17xo adds the 9 F2 columns after F1"] = bool(
+        list(m_xo.columns) == FEATURE_COLUMNS + FEATURE_SETS["p17xo"] + TARGET_COLUMNS)
+    checks["p17 columns unchanged inside p17x"] = bool(
+        m_x[FEATURE_COLUMNS].equals(matrix[FEATURE_COLUMNS].reindex(m_x.index)))
+    gap = pd.MultiIndex.from_product([d6[300:310], [t6[2]]], names=[DATE_LEVEL, TICKER_LEVEL])
+    checks["an F1 gap drops exactly its rows (required)"] = bool(
+        gap.isin(matrix.index).all() and not gap.isin(m_x.index).any()
+        and len(matrix) - len(m_x) == len(gap))
+    checks["F2 never drops a row (optional)"] = bool(m_xo.index.equals(m_x.index))
+    checks["ranked extras in [-1, +1]"] = bool(
+        m_xo[F1_RANKED + F2_OPTIONAL].abs().max().max() <= 1.0 + tol)
+    checks["+inf sector P/E ranks at +1"] = bool(
+        (m_x.xs(t6[0], level=TICKER_LEVEL)["sector_pe"] == 1.0).all())
+    checks["F2 = 0 where a name has no options"] = bool(
+        (m_xo.loc[(slice(None), no_opt), F2_OPTIONAL] == 0.0).all().all())
+    checks["opt_avail raw 0/1"] = bool(set(np.unique(m_xo["opt_avail"])) <= {0.0, 1.0})
+    mk = panels6["market"].reindex(m_x.index.get_level_values(DATE_LEVEL))
+    checks["market features enter raw"] = bool(
+        np.allclose(m_x[F1_MARKET].to_numpy(), mk.to_numpy()))
+    mask6 = pd.DataFrame(True, index=d6, columns=t6)
+    mask6[t6[1]] = False
+    m_mask = create_features(dummy, universe_mask=mask6, feature_set="p17xo", phase6_panels=panels6)
+    checks["universe mask removes a name's rows"] = bool(
+        t6[1] not in m_mask.index.get_level_values(TICKER_LEVEL))
+    m_end = create_features(dummy, label_end_dates=True)
+    checks["label_end_dates adds only the 3 end columns"] = bool(
+        list(m_end.columns) == list(matrix.columns) + TARGET_END_COLUMNS
+        and m_end[list(matrix.columns)].equals(matrix))
+    tk = t6[3]
+    own_dates = dummy.xs(tk, level=TICKER_LEVEL).index
+    row = m_end.xs(tk, level=TICKER_LEVEL).iloc[10]
+    checks["tgt_end_5b = the name's own bar 5 ahead"] = bool(
+        row["tgt_end_5b"] == own_dates[own_dates.get_loc(row.name) + 5])
+    for name, ok in checks.items():
+        print(f"  {name:<46}: {'PASS' if ok else 'FAIL'}")
+    assert all(checks.values()), "feature_creator dry-run FAILED"

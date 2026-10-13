@@ -211,6 +211,10 @@ answering a question about the walk-forward.
   run, and it becomes the F0 baseline of Part B.
 - From Phase 6 onwards every fit runs with the purge on.
 
+**Addendum (2026-10-14, Stage 6).** The rule above counts calendar bars. Labels count each
+name's own bars, so across a halt 0.02% of labels still reached the scored block. The purge
+now uses each label's own realisation date. See §B.8.
+
 ---
 
 ## B · Pre-registration: new information, cheaper trading (N 42 → 57)
@@ -447,9 +451,13 @@ on returns. Every deviation, and every point where the implementation had to set
   - **Nifty 50 P/E is spliced at 2021-03-31.** NSE switched index P/E from standalone to
     consolidated earnings that day. The Nifty 50 P/E fell 18% (40.43 → 33.20) on an index move
     under 1%: a net jump of 0.187 in logs, against at most 0.082 on any other session.
-    - The history before the break is scaled by that day's P/E move net of the index move.
-    - A constant scale leaves every expanding z-score before the break unchanged. From the
-      break on, the scale is known at that day's close.
+    - Values from the break on are divided by that day's P/E move net of the index move,
+      which puts the new methodology on the old scale.
+    - Values before the break are untouched. The scale is known at the break day's close.
+    - *Revised in Stage 6, 2026-10-14, before any return was computed.* The first version
+      scaled the history instead. That gives the same z-scores in exact arithmetic, but
+      it let a later perturbation move the last bit of pre-break values, and the Stage 6
+      causality check, which demands bit-identity, caught it.
     - Sector P/E is not spliced: it is only ever ranked within a date.
 - **2026-10-14 · B.2, F1 readings (Stage 3, clarifications).**
   - **Own bars.** Windows count each stock's own trading bars, as the 17 existing features do.
@@ -462,6 +470,47 @@ on returns. Every deviation, and every point where the implementation had to set
   - **Market z-scores** are computed on the archive's own sessions, then carried onto the panel
     calendar.
   - **Sector features** exist only on cells where the stock traded.
+- **2026-10-14 · §A.7 purge tightened to own bars (Stage 6, a fix).**
+  - **What the check found.** The Stage 6 causality check refits Tier 1 on real and on
+    future-perturbed inputs. With the purge on, predictions before the cut still moved,
+    by up to 0.0475.
+  - **Why.** The purge dropped the last h *calendar* bars of each training block, but a
+    label is log(close at the name's own bar t+h / close_t). Across a halt, the own bar
+    t+h falls later than calendar bar t+h.
+  - **Size.** 3,204 of 15.9M kept training rows (0.02%) had a 21b label ending inside the
+    scored block. At the test cut, 27 labels reached past it, 21 of them from ESSDEE, a
+    long halt.
+  - **Fix.** `create_features(label_end_dates=True)` emits each label's own-bar
+    realisation date (`tgt_end_{h}b`). The purge keeps a training row only if that date is
+    before the scored block's first bar.
+    - The calendar rule remains only as a fallback when the column is absent.
+    - The wf_cache key gains an `ownbar` part, so no calendar-purged fit can be served.
+    - Unpurged runs are unchanged.
+  - **Consequence.** `_PG` now means the own-bar purge. No ledger has ever held a `_PG`
+    cell. The §A.7 quick-check numbers were made under the calendar rule and are not
+    re-run: the rows involved are 0.02%.
+- **2026-10-14 · Stage 6 QC gate Q9 re-specified after its first run (a disclosed revision).**
+  - §B.4 lists what the quality check reports but sets no thresholds. The gates in
+    `scripts/phase6_feature_qc.py` were written in Stage 6.
+  - **v1 failed.** It gated the yearly median *absolute* call−put IV spread at 0.02, and
+    2018 came in at 0.0208.
+  - **What the numbers show.** The *signed* yearly median runs −0.0002 to +0.0061: put-call
+    parity holds and there is no bias, so the forward, the rate and the expiry choice are
+    right. The absolute spread (2014 0.019 → 2025 0.011) is noise from non-synchronous last
+    trades, and it shrinks as liquidity grows.
+  - **v2** gates the bias, |signed| ≤ 0.01, and reports the absolute spread. The v1 log is
+    kept at `data/trial_database/phase6/logs/stage6_feature_qc_v1_Q9abs.log`.
+  - No return was read.
+- **2026-10-14 · Observed in Stage 6, not changed (F0 is frozen): `liq_vol_var_20b` is not
+  invariant to back-adjustment.**
+  - The causality check plants a future 2:1 split. Of all 40 columns, only this one moves on
+    dates before the cut. It is the variance of *volume*, and back-adjustment divides past
+    volume by the split factor, so a later split rescales a name's past variance and
+    therefore its rank.
+  - In principle that is a small look-ahead in the original 17: a name's past feature value
+    depends on a corporate action that had not happened yet.
+  - It is reported, not fixed. F0 is the frozen baseline, and changing it would break the
+    Phase 3–5 reproductions. Every new feature passes the same test.
 - **2026-10-14 · Observed, not changed: what the sector assignment means for small caps.**
   - Names with an obvious sector are assigned correctly: HDFC Bank and ICICI Bank to Financial
     Services or Bank, SBI and PNB to PSU Bank, Infosys and TCS to IT, Sun Pharma to Pharma,

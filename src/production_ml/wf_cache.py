@@ -112,6 +112,12 @@ def cache_key(engine: TreeAlphaEngine, features: pd.DataFrame, frequency: str) -
     # Appended only when on, so every pre-Phase-6 key (and its cache entry) is unchanged.
     if getattr(engine, "purge_label_overlap", False):
         parts += ("purge",)
+        # The exact own-bar purge reads the label realisation dates, so they join the
+        # key. A fit made under the calendar-bar fallback can never be served for it.
+        end_col = f"tgt_end_{engine.horizon}b"
+        if end_col in features.columns:
+            ends = pd.util.hash_pandas_object(features[end_col], index=False).to_numpy()
+            parts += ("ownbar", hashlib.md5(ends.tobytes()).hexdigest())
     return "__".join(parts)
 
 

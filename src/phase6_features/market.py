@@ -17,13 +17,15 @@ VIX starts 2014-05-14 in the archive, so ``mkt_vix_z`` is 0 until mid-2015.
 **The P/E break.** On 2021-03-31 NSE switched index P/E from standalone to consolidated
 earnings. The Nifty 50 P/E fell 18% that day (40.43 → 33.20) while the index moved
 under 1%. An expanding z across that break would read a methodology change as the market
-getting cheap. The series is spliced: every value before the break is scaled by
+getting cheap. The series is spliced: every value **from** the break on is divided by
 
     k = (PE_b / PE_b−1) / (N50_b / N50_b−1),
 
-the day's P/E move net of the index's own move. Scaling every earlier value by one
-constant leaves each z-score before the break unchanged, so nothing before 2021-03-31
-depends on k. From the break on, k is known at the close of the break day.
+the day's P/E move net of the index's own move, putting the new methodology on the old
+scale. Values before the break are untouched, so they cannot depend on k, bit for bit.
+From the break on, k is known at the close of the break day. (Scaling the history by k
+instead gives the same z-scores in exact arithmetic, but not to the last bit, and the
+Stage 6 causality check demands bit-identity.)
 
     python src/phase6_features/market.py            # dry-run self-test
     python src/phase6_features/market.py --build
@@ -65,11 +67,11 @@ def expanding_z(x: pd.Series, min_obs: int = Z_MIN_OBS) -> pd.Series:
 
 
 def splice_pe(pe: pd.Series, level: pd.Series, at: pd.Timestamp = PE_BREAK) -> pd.Series:
-    """Scale the P/E history before ``at`` by the break's net-of-market jump."""
+    """Divide the P/E from ``at`` on by the break's net-of-market jump; history untouched."""
     i = pe.index.get_loc(at)
     k = (pe.iloc[i] / pe.iloc[i - 1]) / (level.loc[pe.index[i]] / level.loc[pe.index[i - 1]])
     out = pe.copy()
-    out.iloc[:i] = out.iloc[:i] * k
+    out.iloc[i:] = out.iloc[i:] / k
     return out
 
 
@@ -151,8 +153,8 @@ def _dry_run() -> None:
     spliced = splice_pe(pe_broken, n50_flat, at=b)
     z_true, z_spl = expanding_z(pe_true), expanding_z(spliced)
     checks["splice removes a pure methodology break"] = bool(np.allclose(z_spl, z_true))
-    checks["splice leaves pre-break z unchanged"] = bool(
-        np.allclose(z_spl.iloc[:700], expanding_z(pe_broken).iloc[:700])
+    checks["splice leaves pre-break z bit-identical"] = bool(
+        z_spl.iloc[:700].equals(expanding_z(pe_broken).iloc[:700])
     )
     checks["break detected net of the index move"] = bool(
         net_jumps(pe_broken, n50_flat).abs().idxmax() == b

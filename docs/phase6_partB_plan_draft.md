@@ -11,8 +11,12 @@
   bit-identical, and worth 3% of IC at 5b and 13% at 21b.
 
 **Not done**
-- Stages 5–9. Stages 0–4 are complete: §B is pre-registered and committed, monthly
-  rebalancing is built and verified, and the F1 and F2 panels are built (2026-10-14).
+- Stages 7–9. Stages 0–6 are complete (2026-10-14):
+  - §B is pre-registered and committed;
+  - monthly rebalancing is built and verified;
+  - the F1 and F2 panels are built;
+  - the pipeline is wired (`--phase6`);
+  - the causality and quality gates pass.
 - The purged ensemble re-score of the Phase 5 grid was started and then paused. Stage 7's F0
   fits replace it.
 - This plan is a draft. The user reviewed it but interrupted approval to deal with machine
@@ -44,7 +48,8 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** start at Stage 5 (wiring), then Stage 6, then Stage 7
+**Resume:** Stage 7, the overnight run. Ask the user how to power it first (a 67 W+
+charger, or `rf.n_jobs` 2–3).
 on a night with a suitable charger or with lowered `rf.n_jobs`.
 
 ## Context
@@ -230,7 +235,18 @@ The row-drop rule changes from "every feature present" to "every *required* feat
 where F2 is optional. Without this change the F2 set would delete two-thirds of the
 universe.
 
-## Stage 5 — wiring
+## Stage 5 — wiring: DONE (2026-10-14)
+
+- `feature_creator.FEATURE_SETS` (`p17`/`p17x`/`p17xo`) and
+  `create_features(feature_set=, phase6_panels=, label_end_dates=)`.
+- `StrategyConfig.feature_set` (`_FX`/`_FXO`), `config.PHASE6_*`, and `TRIAL_LEDGER`
+  +15 (N = 57).
+- `run_pipeline_ml.py --phase6` (with `--feature-sets` for split nights).
+- The 17-feature matrix hashes exactly as before, and Phase 5 reproduces 4/4 on cache
+  hits (gate scored at N = 42 for the comparison).
+- Logs are in `data/phase6/logs/stage5_*`.
+
+The original Stage 5 spec:
 
 - **`feature_creator.py`.**
   - A feature-set registry: `p17` is today's list, and `p17x` and `p17xo` extend it.
@@ -256,7 +272,23 @@ universe.
   - Rebalance cadence is execution-time: it fans out over the shared fit, like construction
     does.
 
-## Stage 6 — causality and quality gates (before any return is looked at)
+## Stage 6 — causality and quality gates (before any return is looked at): DONE (2026-10-14)
+
+- `scripts/phase6_causality.py`: 12/12 pass, on the fourth run. Each earlier run caught
+  something real, and each is logged in §B.8:
+  - a float-level splice dependence, fixed by a forward splice;
+  - a perturbation too weak to catch a within-day leak, fixed with independent OHLC
+    noise;
+  - a halted-stock label leak through the §A.7 purge, fixed with the own-bar purge.
+- `scripts/phase6_feature_qc.py`: 10/10 pass. Q9 was re-specified as a bias test after
+  v1 failed on absolute noise (§B.8).
+- Phase 5 is still 4/4 bit-identical.
+- Informational finding: the frozen F0 feature `liq_vol_var_20b` moves under a future
+  split (§B.8).
+- Logs are in `data/trial_database/phase6/logs/stage6_*`; QC tables are in
+  `data/phase6/qc/`.
+
+The original Stage 6 spec:
 
 - **New `scripts/phase6_causality.py`.** It perturbs every raw input after a cut date D:
   prices, F&O files, index files. Every feature on dates ≤ D must come back bit-identical. A

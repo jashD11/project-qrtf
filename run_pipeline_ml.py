@@ -108,6 +108,7 @@ def make_ml_config(
     construction: str = "buffer",
     purge_label_overlap: bool | None = None,
     rebalance_every: int = 1,
+    feature_set: str = "p17",
 ) -> StrategyConfig:
     """
     A PRODUCTION_ML StrategyConfig with sandbox-only fields pinned to sentinels.
@@ -130,6 +131,7 @@ def make_ml_config(
         construction=construction,
         purge_label_overlap=purge_label_overlap,
         rebalance_every=rebalance_every,
+        feature_set=feature_set,
     )
 
 
@@ -203,11 +205,23 @@ def phase4_regime_config():
 
 
 def compute_signals(
-    frequency: str, decile_pct: float, target_col: str = DEFAULT_TARGET
+    frequency: str, decile_pct: float, target_col: str = DEFAULT_TARGET,
+    feature_set: str = "p17",
 ) -> tuple[WalkForwardResult, pd.DataFrame]:
-    """Tier 1 tree walk-forward for one frequency. Returns (wf_result, price_wide)."""
+    """
+    Tier 1 tree walk-forward for one frequency. Returns (wf_result, price_wide).
+
+    ``feature_set`` selects the input columns (Phase 6, ``feature_creator.FEATURE_SETS``);
+    the default ``"p17"`` builds the pre-Phase-6 matrix byte for byte, so every cached
+    fit keyed on it still hits.
+    """
     bars = load_ohlcv_multiindex(frequency)
-    features = create_features(bars, frequency, universe_mask=load_universe_mask(frequency))
+    # The label realisation dates are emitted only when the purge will read them, so
+    # an unpurged run builds the pre-Phase-6 matrix unchanged.
+    features = create_features(
+        bars, frequency, universe_mask=load_universe_mask(frequency), feature_set=feature_set,
+        label_end_dates=config.ML_CONFIG.purge_label_overlap,
+    )
     # Extract the (small) price panel now, then drop the ~4M-row raw OHLCV frame
     # so it is not resident during the memory-critical walk-forward tree loop.
     # price_wide does not depend on the walk-forward, so this reorder is safe.
@@ -292,6 +306,8 @@ def _record_diagnostics(cfg: StrategyConfig, result) -> None:
         strategy_id=cfg.strategy_id, frequency=cfg.frequency,
         execution_style=cfg.execution_style, target=cfg.target_col,
         **({"construction": cfg.construction} if cfg.construction != "buffer" else {}),
+        **({"feature_set": cfg.feature_set} if cfg.feature_set != "p17" else {}),
+        **({"rebalance_every": cfg.rebalance_every} if cfg.rebalance_every != 1 else {}),
         cum_net=float((1 + result.net).prod() - 1),
         cum_gross=float((1 + result.gross.dropna()).prod() - 1),
         sharpe_net=_cum_sharpe(result.net)[1],
@@ -309,7 +325,9 @@ def _record_diagnostics(cfg: StrategyConfig, result) -> None:
     frame.to_csv(EXEC_DIAGNOSTICS_PATH, index=False)
 
 
-def _persist_ic(wf: WalkForwardResult, frequency: str, target_col: str = "") -> None:
+def _persist_ic(
+    wf: WalkForwardResult, frequency: str, target_col: str = "", feature_set: str = "p17"
+) -> None:
     """
     Write the read-only Tier-1 rank-IC fit diagnostic for one frequency.
 
@@ -320,6 +338,8 @@ def _persist_ic(wf: WalkForwardResult, frequency: str, target_col: str = "") -> 
     if wf.ic_diagnostics is None:
         return
     tag = f"{frequency}_{target_col.rsplit('_', 1)[-1]}" if target_col else frequency
+    if feature_set != "p17":
+        tag += f"_{feature_set}"
     if config.ML_CONFIG.purge_label_overlap:
         tag += "_purge"   # never overwrite the unpurged artifact earlier phases cite
     path = DIAGNOSTICS_PATH_TMPL.format(frequency=tag)
@@ -337,13 +357,23 @@ def _persist_ic(wf: WalkForwardResult, frequency: str, target_col: str = "") -> 
 def build_headline_grid(
     frequencies: list[str], styles: list[str], targets: list[str],
     constructions: list[str] | None = None,
+    feature_sets: list[str] | None = None,
+    cadence: dict[str, int] | None = None,
 ) -> list[StrategyConfig]:
-    """The explicit Cartesian product of the committed [SWEEP] axes."""
+    """
+    The explicit Cartesian product of the committed [SWEEP] axes.
+
+    ``cadence`` maps a target to its rebalance interval (Phase 6: the 21b label trades
+    every 21 bars); a target it does not name trades every bar.
+    """
     constructions = constructions or ["buffer"]
+    feature_sets = feature_sets or ["p17"]
+    cadence = cadence or {}
     return [
-        make_ml_config(freq, style, target_col=target, construction=construction)
-        for freq, style, target, construction in itertools.product(
-            frequencies, styles, targets, constructions
+        make_ml_config(freq, style, target_col=target, construction=construction,
+                       rebalance_every=cadence.get(target, 1), feature_set=fset)
+        for freq, fset, style, target, construction in itertools.product(
+            frequencies, feature_sets, styles, targets, constructions
         )
     ]
 
@@ -351,20 +381,28 @@ def build_headline_grid(
 def run_headline_grid(
     frequencies: list[str], styles: list[str], skip_dsr: bool = False,
     targets: list[str] | None = None, constructions: list[str] | None = None,
+    feature_sets: list[str] | None = None, cadence: dict[str, int] | None = None,
 ) -> None:
     targets = targets or [DEFAULT_TARGET]
     constructions = constructions or ["buffer"]
-    configs = build_headline_grid(frequencies, styles, targets, constructions)
+    feature_sets = feature_sets or ["p17"]
+    cadence = cadence or {}
+    configs = build_headline_grid(
+        frequencies, styles, targets, constructions, feature_sets, cadence
+    )
 
     print(DIVIDER)
     print(f"  PRODUCTION_ML HEADLINE SWEEP — {len(configs)} cells "
           f"({len(frequencies)} freq x {len(styles)} styles x {len(targets)} targets"
-          f"{f' x {len(constructions)} constructions' if len(constructions) > 1 else ''}, "
+          f"{f' x {len(constructions)} constructions' if len(constructions) > 1 else ''}"
+          f"{f' x {len(feature_sets)} feature sets' if len(feature_sets) > 1 else ''}, "
           f"hmm_states={config.HEADLINE_HMM_STATES} frozen)")
     print(DIVIDER)
     for cfg in configs:
         print(f"  {cfg.strategy_id}  ->  freq={cfg.frequency}  style={cfg.execution_style}"
-              f"  target={cfg.target_col}  construction={cfg.construction}")
+              f"  target={cfg.target_col}  construction={cfg.construction}"
+              + (f"  features={cfg.feature_set}  rebalance_every={cfg.rebalance_every}"
+                 if len(feature_sets) > 1 or cadence else ""))
     _print_cost_regime()
 
     # Tier 2 once for the whole run (regime is daily, frequency-independent).
@@ -376,22 +414,29 @@ def run_headline_grid(
     # (date x ticker) Parquets for every style and every target.
     panels = _load_panels_if_needed(styles)
 
-    # Tier 1 once per (frequency, target); fan out Tier 3 + Tier 4 across styles.
-    # The target is a fit-time axis, so it joins frequency in the outer loop — only
-    # the execution style is free to fan out over a shared fit.
-    for frequency, target_col in itertools.product(frequencies, targets):
-        print(f"\n{DIVIDER}\n  FREQUENCY: {frequency} | TARGET: {target_col}\n{DIVIDER}")
+    # Tier 1 once per (frequency, feature set, target); fan out Tier 3 + Tier 4 across
+    # styles. The target and the feature set are fit-time axes, so they join frequency
+    # in the outer loop — only the execution style (and construction and cadence) is
+    # free to fan out over a shared fit.
+    for frequency, feature_set, target_col in itertools.product(
+        frequencies, feature_sets, targets
+    ):
+        fs_tag = f" | FEATURES: {feature_set}" if len(feature_sets) > 1 else ""
+        print(f"\n{DIVIDER}\n  FREQUENCY: {frequency}{fs_tag} | TARGET: {target_col}\n{DIVIDER}")
         print(f"[Tier 1] Tree walk-forward (decile_pct={DECILE_PCT}, "
               f"target={target_col}) — once for {frequency}")
-        wf, price_wide = compute_signals(frequency, DECILE_PCT, target_col=target_col)
-        _persist_ic(wf, frequency, target_col)
+        wf, price_wide = compute_signals(
+            frequency, DECILE_PCT, target_col=target_col, feature_set=feature_set
+        )
+        _persist_ic(wf, frequency, target_col, feature_set)
         terminal = load_terminal_returns(frequency)
 
         # Construction is an execution-time axis like style: it fans out over the
         # same fit, so the Phase 5 grid costs no extra Tier 1 work.
         for style, construction in itertools.product(styles, constructions):
             cfg = make_ml_config(
-                frequency, style, target_col=target_col, construction=construction
+                frequency, style, target_col=target_col, construction=construction,
+                rebalance_every=cadence.get(target_col, 1), feature_set=feature_set,
             )
             print(f"\n[Tier 3] {frequency} | {style} | {target_col} | {construction}")
             result = run_execution(
@@ -414,7 +459,8 @@ def run_headline_grid(
             )
             _record_diagnostics(cfg, result)
 
-    _summarize(configs, PRODUCTION_LEDGER, frequencies, styles, targets, constructions)
+    _summarize(configs, PRODUCTION_LEDGER, frequencies, styles, targets, constructions,
+               feature_sets)
 
     # Tier 4 — the credibility gate: deflate each Sharpe for the full grid's
     # multiple-testing count (N = every cell searched, not just what's written).
@@ -538,29 +584,30 @@ def _cum_sharpe(returns: pd.Series) -> tuple[float, float]:
 def _summarize(
     configs: list[StrategyConfig], ledger_path: str,
     frequencies: list[str], styles: list[str], targets: list[str] | None = None,
-    constructions: list[str] | None = None,
+    constructions: list[str] | None = None, feature_sets: list[str] | None = None,
 ) -> None:
     targets = targets or [DEFAULT_TARGET]
     constructions = constructions or ["buffer"]
+    feature_sets = feature_sets or ["p17"]
     ledger = pd.read_parquet(ledger_path)
     # Map each cell's metrics via the in-memory configs (NOT by parsing the id).
     metrics = {
-        (cfg.frequency, cfg.execution_style, cfg.target_col, cfg.construction): _cum_sharpe(
-            ledger[cfg.strategy_id]
-        )
+        (cfg.frequency, cfg.execution_style, cfg.target_col, cfg.construction,
+         cfg.feature_set): _cum_sharpe(ledger[cfg.strategy_id])
         for cfg in configs if cfg.strategy_id in ledger.columns
     }
 
     print(f"\n{DIVIDER}\n  HEADLINE SWEEP COMPLETE — {ledger.shape[1]} ledger column(s)\n{DIVIDER}")
     print("\n  Per-cell: CumRet / Sharpe")
-    for target, construction in itertools.product(targets, constructions):
+    for fset, target, construction in itertools.product(feature_sets, targets, constructions):
         print(f"\n  target={target}"
-              + (f"  construction={construction}" if len(constructions) > 1 else ""))
+              + (f"  construction={construction}" if len(constructions) > 1 else "")
+              + (f"  features={fset}" if len(feature_sets) > 1 else ""))
         print(f"  {'freq':<14}" + "".join(f"{s:>22}" for s in styles))
         for freq in frequencies:
             cells = []
             for style in styles:
-                cum, sh = metrics.get((freq, style, target, construction), (0.0, 0.0))
+                cum, sh = metrics.get((freq, style, target, construction, fset), (0.0, 0.0))
                 cells.append(f"{cum:>+11.2%}/{sh:>6.2f}")
             print(f"  {freq:<14}" + "".join(f"{c:>22}" for c in cells))
 
@@ -581,6 +628,8 @@ def _summarize(
         _band("target", lambda k: k[2])
     if len(constructions) > 1:
         _band("construction", lambda k: k[3])
+    if len(feature_sets) > 1:
+        _band("feature set", lambda k: k[4])
 
     print("\n  NOTE: hmm_states is not swept — the panic gate is n_states-invariant,")
     print("        so a 2- vs 3-state grid would be return-identical today. Wiring")
@@ -654,6 +703,53 @@ def apply_phase5_regime(args) -> tuple[list[str], list[str], list[str], list[str
     return frequencies, styles, targets, list(config.PHASE5_RUN_CONSTRUCTIONS)
 
 
+# --------------------------------------------------------------------------- #
+# Phase 6 Part B frozen grid (docs/phase6_plan.md §B.3)
+# --------------------------------------------------------------------------- #
+def apply_phase6_regime(args):
+    """
+    Switch the run into the Phase 6 Part B frozen grid: daily_nse500 x {p17, p17x,
+    p17xo} x {5b daily, 21b every 21 bars} x the three Phase 4c styles, all
+    ``cost_swap`` under the Phase 4c cost regime with the label-overlap purge on.
+
+    The grid lives in ``config.PHASE6_*`` and is not overridable here. A run of a subset
+    of feature sets (``--feature-sets``) is allowed, so the ~10-14 h of cold fits can be
+    split across nights, but it is a partial run of the frozen grid. Its DSR gate is
+    deferred to ``--dsr`` once every cell is banked.
+    """
+    from dataclasses import replace
+
+    if (args.frequencies != config.SWEEP_FREQUENCIES
+            or args.styles != config.SWEEP_EXECUTION_STYLES
+            or args.target != [DEFAULT_TARGET]):
+        raise SystemExit("--phase6 runs the frozen grid only (config.PHASE6_*); "
+                         "--frequencies/--styles/--target cannot be combined with it")
+    unknown = set(args.feature_sets or []) - set(config.PHASE6_FEATURE_SETS)
+    if unknown:
+        raise SystemExit(f"--feature-sets {sorted(unknown)} not in {config.PHASE6_FEATURE_SETS}")
+    feature_sets = [f for f in config.PHASE6_FEATURE_SETS
+                    if not args.feature_sets or f in args.feature_sets]
+    if feature_sets != config.PHASE6_FEATURE_SETS and not args.skip_dsr:
+        print("  NOTE: partial run of the frozen grid — DSR gate deferred (--skip-dsr).")
+        args.skip_dsr = True
+
+    config.ML_CONFIG.cost = replace(config.ML_CONFIG.cost, **config.PHASE4C_COST_OVERRIDES)
+    config.ML_CONFIG.purge_label_overlap = True       # §B.1: on for every Phase 6 fit
+    if args.ledger == DEFAULT_PRODUCTION_LEDGER:
+        args.ledger = config.PHASE6_LEDGER
+    os.makedirs(os.path.dirname(args.ledger) or ".", exist_ok=True)
+
+    targets = list(config.PHASE6_CADENCE)
+    print(DIVIDER)
+    print("  PHASE 6 PART B FROZEN GRID (docs/phase6_plan.md §B.3)")
+    print(f"  feature sets {feature_sets} x targets/cadence {config.PHASE6_CADENCE} x "
+          f"styles {config.PHASE6_STYLES} | construction {config.PHASE6_CONSTRUCTION} | "
+          f"purge ON | N = {config.TRIALS_SEARCHED}")
+    print(DIVIDER)
+    return ([config.PHASE6_FREQUENCY], list(config.PHASE6_STYLES), targets,
+            [config.PHASE6_CONSTRUCTION], feature_sets, dict(config.PHASE6_CADENCE))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="PRODUCTION_ML sweep orchestrator")
     parser.add_argument(
@@ -701,6 +797,17 @@ def main() -> None:
              "cells must reproduce Phase 4c bit-for-bit",
     )
     parser.add_argument(
+        "--phase6", action="store_true",
+        help="run the Phase 6 Part B frozen grid (docs/phase6_plan.md §B.3): "
+             "daily_nse500 x {p17, p17x, p17xo} x {5b daily, 21b every 21 bars} x "
+             "3 styles, cost_swap, Phase 4c costs, purge on (18 cells, N=57)",
+    )
+    parser.add_argument(
+        "--feature-sets", nargs="+", default=None, metavar="SET",
+        help="with --phase6: run only these feature sets (a partial run of the frozen "
+             "grid, so the DSR gate is deferred to --dsr)",
+    )
+    parser.add_argument(
         "--skip-dsr", action="store_true",
         help="skip the auto-DSR gate at the end of the grid (for per-frequency "
              "partial runs, whose len(configs) is the wrong N); run `--dsr` "
@@ -719,13 +826,20 @@ def main() -> None:
     global PRODUCTION_LEDGER, GROSS_LEDGER, EXEC_DIAGNOSTICS_PATH
     frequencies, styles, targets = args.frequencies, args.styles, args.target
     constructions = ["buffer"]
+    feature_sets, cadence = ["p17"], {}
 
-    if args.phase4c and args.phase5:
-        parser.error("--phase4c and --phase5 are separate frozen grids; pick one")
+    if sum((args.phase4c, args.phase5, args.phase6)) > 1:
+        parser.error("--phase4c, --phase5 and --phase6 are separate frozen grids; pick one")
+    if args.feature_sets and not args.phase6:
+        parser.error("--feature-sets applies only to --phase6")
     if args.phase4c:
         frequencies, styles, targets = apply_phase4c_regime(args)
     elif args.phase5:
         frequencies, styles, targets, constructions = apply_phase5_regime(args)
+    elif args.phase6:
+        frequencies, styles, targets, constructions, feature_sets, cadence = (
+            apply_phase6_regime(args)
+        )
 
     PRODUCTION_LEDGER = args.ledger
     GROSS_LEDGER = args.ledger.replace(".parquet", "_gross.parquet")
@@ -738,7 +852,7 @@ def main() -> None:
     else:
         run_headline_grid(
             frequencies, styles, skip_dsr=args.skip_dsr, targets=targets,
-            constructions=constructions,
+            constructions=constructions, feature_sets=feature_sets, cadence=cadence,
         )
 
 

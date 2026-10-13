@@ -105,15 +105,25 @@ def target_horizon(target_col: str) -> int:
     return int(m.group(1))
 
 
-def purge_label_overlap(train_block: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def purge_label_overlap(
+    train_block: pd.DataFrame, horizon: int, test_start=None
+) -> pd.DataFrame:
     """
-    Drop the training rows whose label is not yet realised at the block's last bar.
+    Drop the training rows whose label is not yet realised before the scored block.
 
-    Counted in **bars** (unique timestamps), the unit the label is defined in, so
-    the same rule is right on daily and intraday panels.
+    With ``tgt_end_{h}b`` on the frame (``create_features(label_end_dates=True)``) and
+    ``test_start`` given, a row is kept only if its label's own realisation date is
+    before ``test_start``. That is exact: a label counts the name's OWN bars, so across
+    a halt it ends later than h calendar bars on (docs/phase6_plan.md §B.8, Stage 6).
+
+    Without the column, the fallback drops the block's last h bars (unique
+    timestamps). That is right only when every name trades every bar.
     """
     if train_block.empty or horizon <= 0:
         return train_block
+    end_col = f"tgt_end_{horizon}b"
+    if test_start is not None and end_col in train_block.columns:
+        return train_block[train_block[end_col] < test_start]
     stamps = train_block.index.get_level_values(DATE_LEVEL)
     uniq = np.unique(stamps.to_numpy())
     if len(uniq) <= horizon:
@@ -434,7 +444,9 @@ class TreeAlphaEngine:
                 unique_days[train_lo], unique_days[start - 1]
             )
             if self.purge_label_overlap:
-                train_block = purge_label_overlap(train_block, self.horizon)
+                train_block = purge_label_overlap(
+                    train_block, self.horizon, test_start=unique_days[start]
+                )
             test_hi: int = min(start + self.predict_window, n_dates) - 1
             test_block: pd.DataFrame = _slice(unique_days[start], unique_days[test_hi])
 
@@ -711,6 +723,32 @@ if __name__ == "__main__":
         max(reach[False]) >= 0)
     purge_checks["purged: no label reaches the scored block"] = max(reach[True]) < 0
     purge_checks["purged: drops nothing more than needed"] = max(reach[True]) == -1
+    # Own-bar realisation dates (create_features(label_end_dates=True)). With no halt
+    # the exact rule equals the calendar fallback; across a halt the fallback leaks
+    # and the exact rule does not (the Stage 6 causality finding, phase6_plan §B.8).
+    def _with_ends(frame: pd.DataFrame) -> pd.DataFrame:
+        stamp = pd.Series(frame.index.get_level_values(DATE_LEVEL), index=frame.index)
+        return frame.assign(**{f"tgt_end_{h}b": stamp.groupby(level=TICKER_LEVEL).shift(-h)})
+
+    test_start = all_days[504]
+    full = _with_ends(dummy)
+    blk = full[full.index.get_level_values(DATE_LEVEL) < test_start]
+    purge_checks["own-bar rule == calendar rule when nothing halts"] = (
+        purge_label_overlap(blk, h, test_start=test_start).index.equals(
+            purge_label_overlap(blk.drop(columns=f"tgt_end_{h}b"), h).index))
+    t0 = dummy.index.get_level_values(TICKER_LEVEL).unique()[0]
+    halt = (dummy.index.get_level_values(TICKER_LEVEL) == t0) & dummy.index.get_level_values(
+        DATE_LEVEL).isin(all_days[490:500])
+    halted = _with_ends(dummy[~halt])
+    hblk = halted[halted.index.get_level_values(DATE_LEVEL) < test_start]
+    cal = purge_label_overlap(hblk, h)                          # the fallback
+    own = purge_label_overlap(hblk, h, test_start=test_start)
+    purge_checks["canary: calendar rule leaks across a halt"] = bool(
+        (cal[f"tgt_end_{h}b"] >= test_start).any())
+    purge_checks["own-bar rule: no kept label reaches the block"] = bool(
+        (own[f"tgt_end_{h}b"] < test_start).all())
+    purge_checks["own-bar rule drops only the halted name's extra rows"] = bool(
+        set(cal.index.difference(own.index).get_level_values(TICKER_LEVEL)) == {t0})
     for name, ok in purge_checks.items():
         print(f"  {name:<52}: {'PASS' if ok else 'FAIL'}")
     print("=" * 70)
