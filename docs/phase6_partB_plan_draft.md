@@ -39,7 +39,7 @@
 **Machine constraints (measured 2026-10-07; MacBook Pro M1 Pro, 8 cores, 16 GB)**
 - Measured: whole-Mac draw is about **32 W** with `rf.n_jobs = 6`, against about 5.5 W idle.
   The user's charger is **20 W (~19 W delivered)**.
-- Consequence: Stage 7 (6 cold ensemble fits, about 10–14 h) **drains the battery even when
+- Consequence: Stage 7 (6 cold ensemble fits, about 6–7 h on a big charger; see the runbook) **drains the battery even when
   run alone**. Either use a 67 W or 96 W charger, or lower `config._RFConfig.n_jobs` to 2–3.
   The results are invariant to `n_jobs`; Random Forest becomes about 2× slower, and power is
   roughly break-even.
@@ -48,9 +48,8 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** Stage 7, the overnight run. Ask the user how to power it first (a 67 W+
-charger, or `rf.n_jobs` 2–3).
-on a night with a suitable charger or with lowered `rf.n_jobs`.
+**Resume:** Stage 7, the overnight run. The user chose a 67 W+ charger (2026-10-14). Follow
+the **Stage 7 runbook** below.
 
 ## Context
 
@@ -304,9 +303,71 @@ The original Stage 6 spec:
 
 - `python run_pipeline_ml.py --phase6` runs 6 cold ensemble fits: 3 feature sets × 2 targets.
   The F0 fits are also the leak-fixed baseline that was put aside earlier.
-- Expect roughly 10–14 hours, with the laptop running hot through Random Forest.
-  `rf.n_jobs` does not change results, so it can be lowered for less heat at the cost of
+- `rf.n_jobs` does not change results, so it can be lowered for less heat at the cost of
   time.
+
+### Stage 7 runbook (written 2026-10-14; the user is launching soon, on a 67 W+ charger)
+
+**How long.** About 6–7 h; budget 8. This replaces the old 10–14 h guess.
+- The fit cache records a full 17-feature ensemble fit on NSE-500 at 30–36 min. Random
+  Forest is about 28 of those; LightGBM and XGBoost take about 1 min each.
+- Random Forest considers every feature at each split, so its time scales with the feature
+  count.
+
+| fits | features | per fit | × 2 targets |
+|---|---|---|---|
+| p17 | 17 | ~33 min | ~1.1 h |
+| p17x | 31 | ~60 min | ~2.0 h |
+| p17xo | 40 | ~78 min | ~2.6 h |
+| feature builds and Tier 3 for 18 cells | | | ~0.5 h |
+
+- Heat throttling or memory pressure could push it towards 8 h.
+- At `rf.n_jobs = 2–3` (for a 20 W charger), budget about 11–12 h.
+
+**RAM.** The peak is about 5–7 GB: the 40-column matrix is ~0.5 GB, the Phase 6 panels
+~0.7 GB, plus transients while features build and RF's 6 workers. The Mac has 16 GB.
+
+**Before launch:**
+1. **Restart the Mac** with "Reopen windows when logging back in" unticked.
+   - On 2026-10-14, 6.8 of 8 GB of swap was in use, left over from Stage 6 jobs that ran
+     side by side. Swap is not released until a restart.
+2. **Use the big charger, and charge first.** The battery was at 15%. `pmset -g batt` must
+   show `AC Power`.
+3. **Quit everything else**: Chrome (3.8 GB and 28 processes on 2026-10-14, one tab alone
+   ~1.1 GB at ~49% CPU), VS Code, Spotify, WhatsApp, Grammarly, Safari. Keep Terminal, and
+   Claude Code only if it is monitoring.
+4. **Turn Low Power Mode off.** Set "Prevent automatic sleeping on power adapter".
+5. **Hard, flat surface**, vents clear.
+6. **No MATLAB batch** running, or due to start.
+
+**Launch** (detached and awake, logged). Keep the `-u`: without it Python block-buffers
+stdout into the log, and the progress lines show up hours late or only at exit.
+
+```
+cd "/Users/jash/Desktop/Quant Research/qrtf_engine"
+caffeinate -ims nohup python -u run_pipeline_ml.py --phase6 \
+    > data/trial_database/phase6/logs/stage7_run.log 2>&1 &
+```
+
+**Split across nights** (optional). The DSR gate is deferred automatically on a partial
+run.
+- Night A: `--phase6 --feature-sets p17 p17x` (about 3.3 h).
+- Night B: `--phase6 --feature-sets p17xo` (about 2.8 h).
+- Then score once at N = 57: `python run_pipeline_ml.py --dsr data/trial_database/phase6/phase6_dsr_matrix.parquet`.
+
+**Monitor.** `grep -E "wf_cache|Walk-forward done|Tier 3|Traceback|Error" data/trial_database/phase6/logs/stage7_run.log`
+- Each of the 6 fits prints a `MISS` (it is cold), then `Walk-forward done`.
+- A crash mid-run loses only the fit in progress: finished fits sit in `wf_cache` and are
+  re-served on a relaunch.
+
+**After the run (read-only, no tuning):**
+- Check the ledger has 18 columns, `phase6_dsr_matrix_dsr_gate.csv` was written at N = 57,
+  and the execution diagnostics are there.
+- Report:
+  - every cell's DSR (headline: any > 0.95);
+  - Δ net Sharpe F0→F1 and F1→F2 per cell (all 12, none selected);
+  - per-feature IC of the new features by year (read-only).
+- Do **not** open the holdout. That is Stage 8, once.
 - Afterwards:
   - DSR gate at N = 57;
   - Δ tables from F0 to F1 and from F1 to F2;

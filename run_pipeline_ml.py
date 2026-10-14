@@ -713,7 +713,7 @@ def apply_phase6_regime(args):
     ``cost_swap`` under the Phase 4c cost regime with the label-overlap purge on.
 
     The grid lives in ``config.PHASE6_*`` and is not overridable here. A run of a subset
-    of feature sets (``--feature-sets``) is allowed, so the ~10-14 h of cold fits can be
+    of feature sets (``--feature-sets``) is allowed, so the ~6-7 h of cold fits can be
     split across nights, but it is a partial run of the frozen grid. Its DSR gate is
     deferred to ``--dsr`` once every cell is banked.
     """
