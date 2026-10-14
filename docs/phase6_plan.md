@@ -1,7 +1,9 @@
 # Phase 6 plan: why the signal decays, then a better signal
 
 Status: **Part A pre-registered** (2026-10-06) and run (results:
-[`phase6_decay_results.md`](phase6_decay_results.md)). **Part B pre-registered** (2026-10-14).
+[`phase6_decay_results.md`](phase6_decay_results.md)). **Part B pre-registered** (2026-10-14)
+and run: 0/18 pass at N = 57, and the §B.6 stop rule fires. The holdout is kept sealed (§B.8, last
+entry). Results: [`phase6_results.md`](phase6_results.md).
 Execution plan: [`phase6_partB_plan_draft.md`](phase6_partB_plan_draft.md).
 Idea note: [`phase6_idea.md`](phase6_idea.md).
 
@@ -542,3 +544,15 @@ on returns. Every deviation, and every point where the implementation had to set
     removes.
   - **Open interest** is divided by that day's `adj_factor`, as the panel does for volume,
     so a split does not register as a jump in OI.
+- **2026-10-14 · B.5 holdout step not run (a decision after Stage 7, disclosed).** Stage 8
+  was not run. No file dated after 2025-06-30 was downloaded or read. The post-2025-06-30
+  holdout stays **sealed**.
+  - **Why.** Every cell failed the in-sample headline (best DSR 0.182 at N = 57). Part B
+    succeeds only for a cell that passes the headline **and** survives the holdout, so the
+    holdout could not change the verdict. Scoring it would spend the program's only unseen
+    data on a question that is already answered.
+  - **What it is kept for.** It is the clean test for a later, separately pre-registered idea:
+    F3 delivery, Part A's parked cells, or a new program. That pre-registration must be
+    committed before the holdout is opened. Data after today extends it.
+  - **What this does not change.** The headline, the Δ tables and the stop rule are as
+    pre-registered. Nothing was tuned or re-selected.

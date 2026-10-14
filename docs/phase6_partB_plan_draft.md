@@ -48,8 +48,9 @@
   Stages 1–6 (code, feature builds, dry-runs) are light enough to overlap, but stop
   CPU-heavy steps before the MATLAB timing runs.
 
-**Resume:** Stage 7, the overnight run. The user chose a 67 W+ charger (2026-10-14). Follow
-the **Stage 7 runbook** below.
+**Status: closed (2026-10-14).** Stage 7 ran: 0/18 pass at N = 57, and the §B.6 stop rule fires.
+Stage 8 (the holdout) was **not run**, by decision, and the holdout stays sealed (`phase6_plan.md`
+§B.8). Stage 9's write-up is [`phase6_results.md`](phase6_results.md).
 
 ## Context
 
@@ -374,7 +375,7 @@ run.
   - **read-only** per-feature IC of the new features, using `scripts/phase6_decay.py`
     functions (`per_feature_ic`, `by_year`). This is reported, never selected on.
 
-## Stage 8 — holdout (once)
+## Stage 8 — holdout (once) — NOT RUN; the holdout is kept sealed (§B.8, 2026-10-14)
 
 1. Download equity, index and F&O data from 2025-07-01 to the latest date with
    `bhavcopy_download.py --start/--end`. The F&O kinds take the longest.
