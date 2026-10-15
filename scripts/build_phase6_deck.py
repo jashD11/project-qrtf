@@ -33,7 +33,7 @@ from src.production_ml.tier4_dsr_gate import probabilistic_sharpe_ratio, run_dsr
 
 esc, Frame, svg_open, gridlines, nice_ticks, ref_marks = (
     bd.esc, bd.Frame, bd.svg_open, bd.gridlines, bd.nice_ticks, bd.ref_marks)
-svg_line, svg_bars, svg_waterfall, stats, table = bd.svg_line, bd.svg_bars, bd.svg_waterfall, bd.stats, bd.table
+svg_line, svg_bars, stats, table = bd.svg_line, bd.svg_bars, bd.stats, bd.table
 
 OUT = ROOT / "docs" / "presentation" / "phase6_deck.html"
 P6, P5 = LEDGER / "phase6", LEDGER / "phase5"
@@ -142,14 +142,9 @@ for sid, row in p5_diag.iterrows():
         "cagr": cagr(p5_net[sid]), "dd": max_dd(p5_net[sid]),
         "drag": float(row["trade_drag_annual"]), "turn": float(row["turnover_mean"]),
     }
-P5_BUF = P5R[("5b", "dynamic_tilt_slb", "buffer")]
 P5_M2 = P5R[("5b", "dynamic_tilt_slb", "cost_swap")]
 P5_STAR = float(p5_gate.loc[P5_M2["sid"], "SR_star_ann"])
 P5_BAR = needed_sr(p5_gate.loc[P5_M2["sid"]])
-
-# Phase 4c long/short, one correction at a time. SOURCE: docs/phase4c_results.md,
-# the same four values build_deck.py draws.
-WATERFALL = [1.78, 1.35, -0.23, -0.99]
 
 # ── data: Part A (why the edge faded) ────────────────────────────────────────
 
@@ -185,7 +180,6 @@ EARLY_IC = wmean(ens, ("5b",), EARLY_Y)
 LATE_IC = wmean(ens, ("5b",), LATE_Y)
 RECENT_IC = wmean(ens, ("5b",), RECENT_Y)
 COMP_LATE = wmean(comp, ("5b",), LATE_Y)
-COMP_RECENT = wmean(comp, ("5b",), RECENT_Y)
 WIN = {w: {"late": wmean(window, (w,), LATE_Y), "recent": wmean(window, (w,), RECENT_Y)}
        for w in ("252", "504", "1008")}
 CEIL_RECENT = wmean(ridge_ceil, ("ceiling",), RECENT_Y)
@@ -450,36 +444,6 @@ def diagram_feature_fade():
     return "".join(o)
 
 
-def diagram_purge():
-    """The label-overlap leak: the last training days' 5-day answers reach into the
-    test period. The fix removes those days."""
-    w, h = 940, 250
-    o = [svg_open(w, h)]
-    edge, day = 600, 15
-    for row, (y, title, fixed) in enumerate(((70, "BEFORE", False), (185, "AFTER THE FIX", True))):
-        o.append(f'<text class="dg-t" x="20" y="{y-36}">{title}</text>')
-        o.append(f'<rect class="wf-train" x="70" y="{y}" width="{edge-70-(5*day if fixed else 0)}" height="22" rx="3"/>')
-        if fixed:
-            o.append(f'<rect class="purged" x="{edge-5*day+1}" y="{y}" width="{5*day-2}" height="22" rx="3"/>')
-            o.append(f'<text class="dg-s" x="{edge-2.5*day}" y="{y+40}" text-anchor="middle">5 days dropped</text>')
-        o.append(f'<rect class="wf-pred" x="{edge+4}" y="{y}" width="{900-edge-4}" height="22" rx="3"/>')
-        o.append(f'<text class="wf-key-in" x="80" y="{y+15}">training: 2 years</text>')
-        o.append(f'<text class="wf-key-in" x="{edge+14}" y="{y+15}">test quarter (never seen)</text>')
-        for i in range(10):
-            x = edge - (10 - i) * day + day / 2
-            if fixed and x > edge - 5 * day:
-                continue
-            x2 = x + 5 * day
-            leak = x2 > edge
-            cls = "arc-leak" if leak else "arc-ok"
-            o.append(f'<path class="{cls}" d="M{x:.1f},{y} Q{x+2.5*day:.1f},{y-34} {x2:.1f},{y}"/>')
-            o.append(f'<circle class="{cls}-d" cx="{x2:.1f}" cy="{y}" r="2.6"/>')
-    o.append('<text class="dg-s c3t" x="700" y="30">red: the last training days\' 5-day</text>')
-    o.append('<text class="dg-s c3t" x="700" y="44">answers land inside the test quarter</text>')
-    o.append("</svg>")
-    return "".join(o)
-
-
 def diagram_nest():
     """Three nested feature sets. Each contains the one before."""
     w, h = 940, 300
@@ -500,30 +464,6 @@ def diagram_nest():
         o.append(f'<text class="dg-s" x="{tx}" y="{y+48}">{count}</text>')
         for j, line in enumerate(lines):
             o.append(f'<text class="nest-l" x="{tx}" y="{y+76+j*20}">{esc(line)}</text>')
-    o.append("</svg>")
-    return "".join(o)
-
-
-def diagram_holdout():
-    """The sealed holdout can be used once. Two choices, two outcomes."""
-    w, h = 940, 250
-    o = [svg_open(w, h)]
-    o.append('<rect class="seg-sealed2" x="20" y="78" width="230" height="96" rx="8"/>')
-    o.append(lock(135, 96, 1.1))
-    o.append('<text class="dg-t" x="135" y="148" text-anchor="middle">sealed holdout</text>')
-    o.append('<text class="dg-s" x="135" y="165" text-anchor="middle">everything after 30 Jun 2025</text>')
-    cards = [(16, "no", "OPEN IT NOW", ["score the 18 strategies that already failed",
-                                        "→ learns nothing new, and the data is then \"seen\"",
-                                        "→ no clean test left for the next idea"]),
-             (138, "ok", "KEEP IT SEALED  (chosen)", ["write the next idea down first: rules, thresholds, stop rule",
-                                                      "→ open the holdout once, for that idea only",
-                                                      "→ one honest verdict"])]
-    for y, cls, title, lines in cards:
-        o.append(f'<path class="fork {cls}" d="M250,126 C290,126 290,{y+48} 330,{y+48}"/>')
-        o.append(f'<rect class="card-{cls}" x="330" y="{y}" width="590" height="96" rx="8"/>')
-        o.append(f'<text class="verdict-t {cls}" x="350" y="{y+26}">{title}</text>')
-        for j, line in enumerate(lines):
-            o.append(f'<text class="dg-s2" x="350" y="{y+50+j*18}">{esc(line)}</text>')
     o.append("</svg>")
     return "".join(o)
 
@@ -698,35 +638,7 @@ slide(
     figure=diagram_phases(),
 )
 
-# 4 · costs, then M2
-slide(
-    layout="figure",
-    section="The story so far",
-    title="Costs ate the edge; smarter trading won half of it back",
-    body=f"""
-<div class="two">
-{pts("<strong>Left</strong>: the 500-stock result that first passed, corrected one step at a time. "
-     "Measuring the real cost of trading is what killed it.")}
-{pts(f"<strong>Right</strong>: the best strategy (130/30, 5-day). Swapping a stock only when the expected "
-     f"gain beats the cost (rule M2) lifted it from {fmt(P5_BUF['sr'])} to <strong>{fmt(P5_M2['sr'])}</strong>. "
-     f"A pass needed about {P5_BAR:.1f}.",
-     "<strong>The trading problem is largely solved. The forecast is not strong enough.</strong>")}
-</div>
-""",
-    body_class="body",
-    figure='<div class="two">' + svg_waterfall([
-        {"label": "first reported", "value": WATERFALL[0], "state": "start"},
-        {"label": "honest count|of attempts", "value": WATERFALL[1], "state": "pass"},
-        {"label": "measured|spread & impact", "value": WATERFALL[2], "state": "fail"},
-        {"label": "only borrowable|shorts", "value": WATERFALL[3], "state": "fail"},
-    ], w=640, h=380) + ml_ticks(svg_bars(["no costs|(ceiling)", "after costs,|old rule", "after costs,|M2"], [
-        {"name": "Sharpe", "values": [P5_BUF["gsr"], P5_BUF["sr"], P5_M2["sr"]], "cls": "c1", "neg_cls": "c3"},
-    ], w=520, h=320, ytitle="Sharpe ratio, 130/30 with a 5-day forecast", value_fmt=lambda v: fmt(v, 2), barw=70,
-        ref=[{"y": P5_BAR, "label": f"needed|≈ {P5_BAR:.1f}"}, {"y": P5_STAR, "label": f"luck alone|{P5_STAR:.2f}"}])) + "</div>",
-    caption="Left: long/short strategy, Sharpe after each correction. Right: " + SHARPE_NOTE,
-)
-
-# 5 · forecast fading
+# 4 · forecast fading
 slide(
     layout="split",
     section="The story so far",
@@ -736,7 +648,8 @@ slide(
         "and how they actually did. 0 is a coin flip; 0.02–0.05 is useful in equities.",
         f"2016–20 it averaged <strong>{EARLY_IC:.3f}</strong>. From 2021 it fell to <strong>{LATE_IC:.3f}</strong>, "
         f"and to <strong>{RECENT_IC:.3f}</strong> in 2024–25.",
-        "Cheaper trading can't fix this. A weaker forecast is less to trade on, however cheaply.",
+        f"Phase 5's smarter trading (swap only when the gain beats the cost) lifted the best strategy to "
+        f"{fmt(P5_M2['sr'])}, short of the {P5_BAR:.1f} needed. What's left is the forecast.",
         "<strong>That is what Phase 6 set out to explain, and fix.</strong>",
     ),
     figure=bars_colored([str(y) if y < 2025 else "2025|Jan–Jun" for y in YEARS], IC_ENS,
@@ -747,7 +660,7 @@ slide(
     caption="Mean daily rank correlation between forecast and the next 5 days' returns. Dashed lines: day-weighted averages.",
 )
 
-# 6 · two questions
+# 5 · two questions
 slide(
     layout="text",
     section="Why Phase 6",
@@ -769,36 +682,7 @@ repository before any result was computed.</p>
 """,
 )
 
-# 7 · five suspects
-slide(
-    layout="text",
-    section="Q1 · Why the edge faded",
-    title="Five suspects",
-    body=cards([
-        ("1", "Competed away", "Well-known signals stop paying once enough traders use them.",
-         f"almost: {N_DECAYED} of {N_SKILL} signals faded, rule needed 8", "warn"),
-        ("2", "The market changed", "The signals work in some market moods and not others, and the mood shifted.",
-         "cleared: no signal flipped", "ok"),
-        ("3", "Model set up wrong", "The training window is too short or too long to keep up.",
-         "cleared: no setup recovers it", "ok"),
-        ("4", "Different stocks", "The 500-stock universe filled up with newer, different companies.",
-         "cleared: explains ~0% of the drop", "ok"),
-        ("5", "Bad data", "Price errors or corporate actions corrupting the inputs.",
-         "cleared: data got cleaner", "ok"),
-    ]) + f"""
-<div class="two" style="margin-top:16px">
-{pts("No suspect met its pass mark, so formally the decay is <strong>unexplained</strong>. The rule is not relaxed after the fact.",
-     f"But suspect 1 missed by one signal, and its other two conditions held.")}
-{pts("The rest of this section is the evidence for suspect 1.")}
-</div>
-""",
-    notes=("Pass marks: suspect 1 needed two-thirds of the skill signals to lose half their strength; "
-           "suspect 2 a sign flip or a state difference with |t| ≥ 3 (largest was 2.6); suspect 4 needed the "
-           "universe's age mix to explain half the drop (it explains −1%); suspect 5 needed data disagreement "
-           "to double (it fell to 0.29×)."),
-)
-
-# 8 · what faded and what held
+# 6 · what faded and what held
 slide(
     layout="figure",
     section="Q1 · Why the edge faded",
@@ -808,9 +692,10 @@ slide(
 {pts(f"<strong>Faded (red)</strong>: low volatility, lottery-like jumps, illiquidity, 1-year momentum. "
      f"About <strong>{FADE*100:.0f}%</strong> of their strength is gone.",
      "<strong>Held (green)</strong>: short-term reversal and turnover. Some got stronger.")}
-{pts("The faded group is the most published and most traded set of stock anomalies. "
-     "Published anomalies lose about half their return after publication.",
-     "<strong>Reading</strong>: the crowded signals got crowded out.")}
+{pts(f"Five causes were tested against pass marks set in advance (appendix A2). None met its mark; "
+     f"<strong>crowding</strong> missed by one signal ({N_DECAYED} of {N_SKILL} faded, 8 needed).",
+     "The faded group is the most published set of stock anomalies, and published anomalies lose about half "
+     "their return. <strong>Reading</strong>: they got crowded out.")}
 </div>
 <p class="cite">Low volatility: Ang et al. (2006), Frazzini &amp; Pedersen (2014). Lottery: Bali, Cakici &amp;
 Whitelaw (2011). Illiquidity: Amihud (2002). Decay after publication: McLean &amp; Pontiff (2016).</p>
@@ -819,7 +704,7 @@ Whitelaw (2011). Illiquidity: Amihud (2002). Decay after publication: McLean &am
     figure=diagram_feature_fade(),
 )
 
-# 9 · no model could have found it
+# 7 · no model could have found it
 _rc = lambda col: [float(ridge_ceil.loc[y, (col, "mean_IC")]) for y in YEARS]  # noqa: E731
 _cp = [float(comp.loc[y, ("5b", "mean_IC")]) for y in YEARS]
 _fig9 = declutter(svg_line([
@@ -851,54 +736,7 @@ slide(
            "model even in early years. It is built the same way every year, and its collapse is what matters."),
 )
 
-# 10 · memory
-slide(
-    layout="split",
-    section="Q1 · Why the edge faded",
-    title="The trees chase noise; longer memory helps",
-    body=pts(
-        "Same model, three training windows: 1, 2 (used) and 4 years.",
-        f"Recently, the longest memory does best: <strong>{WIN['1008']['recent']:.3f}</strong> vs "
-        f"{WIN['504']['recent']:.3f} (2 years) and {WIN['252']['recent']:.3f} (1 year).",
-        "The model isn't adapting too <em>slowly</em>. It adapts too <em>fast</em>: "
-        "a training window that contains the 2020 crash teaches it the wrong lessons.",
-        "A rule that never adapts at all beats every window.",
-        "<strong>Parked as a future idea</strong>, not tried here: choosing it after seeing this would be cheating.",
-    ),
-    figure=svg_bars(["2021–25", "2024–25"], [
-        {"name": "1-year memory", "values": [WIN["252"]["late"], WIN["252"]["recent"]], "cls": "cn"},
-        {"name": "2-year (used)", "values": [WIN["504"]["late"], WIN["504"]["recent"]], "cls": "c1"},
-        {"name": "4-year memory", "values": [WIN["1008"]["late"], WIN["1008"]["recent"]], "cls": "c2"},
-        {"name": "frozen 2016–20 rule", "values": [COMP_LATE, COMP_RECENT], "cls": "c4"},
-    ], w=620, h=330, ytitle="forecast skill (5-day forecast)", value_fmt=lambda v: fmt(v, 3)),
-    legend_items=[("1-year memory", "cn"), ("2-year (used)", "c1"), ("4-year memory", "c2"), ("frozen 2016–20 rule", "c4")],
-    caption="2025 is January–June. Window comparison uses one learner (LightGBM) on common dates; the frozen rule uses fixed signs.",
-    notes="Fold skill correlates −0.50 with the share of the training window that falls in the COVID period.",
-)
-
-# 11 · the leak
-slide(
-    layout="figure",
-    section="Q1 · Why the edge faded",
-    title="One honest correction along the way",
-    body=f"""
-<div class="two">
-{pts("A 5-day forecast is trained on 5-day answers. The last few training days' answers weren't known yet "
-     "on the first test day, so the model had a small peek at the test period.",
-     "The fix drops those days from training. It is applied to every strategy from here on.")}
-{pts(f"Best strategy: Sharpe <strong>{fmt(P5_M2['sr'])} → {fmt(BEST['sr'])}</strong>, "
-     f"annual return {pct(P5_M2['cagr'], 1)} → {pct(BEST['cagr'], 1)}.",
-     "<strong>The leak-free numbers are the true baseline.</strong> Every Phase 6 result is compared against them.")}
-</div>
-""",
-    body_class="body",
-    figure=diagram_purge(),
-    caption="Each arc is one training day's answer, reaching 5 trading days ahead.",
-    notes=("Found during the decay study. It cost about 3% of forecast skill at 5 days and about 13% at 21 days. "
-           "A uniform correction like this does not count as a new attempt."),
-)
-
-# 12 · the plan
+# 8 · the plan
 slide(
     layout="figure",
     section="Q2 · Trying to improve it",
@@ -917,7 +755,7 @@ slide(
     figure=diagram_nest(),
 )
 
-# 13 · the result
+# 9 · the result
 _rows13 = [{"label": STYLE_LAB[s], "sub": TGT_LAB[t], **{f: cell(t, s, f)["sr"] for f in FS}} for t, s in ORDER]
 slide(
     layout="figure",
@@ -925,11 +763,14 @@ slide(
     title="Adding new data made every strategy worse",
     body=f"""
 <div class="two">
-{pts(f"The base model beats both richer versions in <strong>{BASE_WINS} of 6</strong> strategies.",
-     f"Adding price & index data cost up to {fmt(MAX_DROP, 2)} of Sharpe. "
-     "Options & futures data won a little back on the 5-day forecast, never enough.")}
-{pts(f"<strong>{N_PASS} of {len(R)}</strong> strategies pass. The best is still the base model at "
-     f"{fmt(BEST['sr'])}, against {fmt(SR_STAR)} from luck alone.")}
+{pts(f"The base model beats both richer versions in <strong>{BASE_WINS} of 6</strong> strategies. "
+     f"Price & index data cost up to {fmt(MAX_DROP, 2)} of Sharpe; options & futures won a little back.",
+     f"It is the forecast, not the trading: skill roughly halved ({IC_FS[('5b','p17')]:.3f} → "
+     f"{IC_FS[('5b','p17x')]:.3f} at 5 days) while turnover barely moved.")}
+{pts(f"<strong>{N_PASS} of {len(R)}</strong> pass. The best is the base model at <strong>{fmt(BEST['sr'])}</strong> "
+     f"(luck-test score {BEST['dsr']:.2f}, pass 0.95), against {fmt(SR_STAR)} from luck alone.",
+     f"That is lower than Phase 5's {fmt(P5_M2['sr'])}: a small training leak, where the last training days' "
+     "answers overlapped the test period, was found and fixed.")}
 </div>
 """,
     body_class="body",
@@ -939,39 +780,7 @@ slide(
     caption=SHARPE_NOTE + " 2016-01 to 2025-06.",
 )
 
-# 14 · the forecast got worse
-_ic5 = {f: [float(ic6.loc[y, ("5b", f, "mean_IC")]) for y in YEARS] for f in ("p17", "p17x")}
-_fig14b = declutter(svg_line([
-    {"name": "base", "x": list(range(10)), "y": _ic5["p17"], "cls": "c2", "width": 2.4, "xlab": [str(y) for y in YEARS]},
-    {"name": "+ price/index", "x": list(range(10)), "y": _ic5["p17x"], "cls": "c4", "width": 2},
-], w=560, h=300, ylab=lambda v: f"{v:g}".replace("-", "−"), xticks=[(i, f"'{str(y)[2:]}") for i, y in enumerate(YEARS)],
-    hover_fmt=lambda v: fmt(v, 3)))
-_turn = {f: [cell(t, s, f)["turn"] for t, s in ORDER] for f in FS}
-slide(
-    layout="figure",
-    section="Q2 · Trying to improve it",
-    title="The forecast got worse, not the trading",
-    body=f"""
-<div class="two">
-{pts(f"Forecast skill roughly <strong>halved</strong> with the first new layer: "
-     f"{IC_FS[('5b','p17')]:.3f} → {IC_FS[('5b','p17x')]:.3f} at 5 days. The random forest fell furthest, "
-     f"{RF_FS['p17']:.3f} → {RF_FS['p17x']:.3f}.",
-     f"Trading barely changed: turnover moved by at most "
-     f"{max(abs(a/b-1) for f in FS[1:] for a, b in zip(_turn[f], _turn['p17']))*100:.0f}%.")}
-{pts("After 2021, the period it was meant to fix, it helped in 2021–22 and hurt in 2023–25. "
-     f"Averaged over 2021–25: {IC6_LATE['p17']:.3f} → {IC6_LATE['p17x']:.3f}.")}
-</div>
-""",
-    body_class="body",
-    figure='<div class="two">' + svg_bars(["5-day forecast", "21-day forecast"], [
-        {"name": FS_LAB[f], "values": [IC_FS[(t, f)] for t in TARGETS], "cls": FS_CLS[f]} for f in FS
-    ], w=560, h=300, ytitle="forecast skill, whole period", value_fmt=lambda v: fmt(v, 3)) +
-        shade_line(_fig14b, 560, 300, 10, 5, 9, "2021 ONWARD") + "</div>",
-    legend_items=[(FS_LAB[f], FS_CLS[f]) for f in FS],
-    caption="Right: forecast skill by year, 5-day forecast.",
-)
-
-# 15 · good ingredients, diluted
+# 10 · good ingredients, diluted
 _fi = {p: [abs(float(feat_ic.loc[k, f"{p}_mean_IC"])) * (1 if feat_ic.loc[k, f"{p}_mean_IC"] * FEAT_SIGN[k] > 0 else -1)
            for k, _ in NEW_FEATS] for p in ("early", "late", "recent")}
 _sim5 = [float(sim.loc[y, "5b p17x"]) for y in YEARS]
@@ -1002,74 +811,7 @@ slide(
             "Right: + price & index model vs base model, 5-day forecast. 1.0 would mean the same ranking.",
 )
 
-# 16 · monthly rebalancing
-slide(
-    layout="figure",
-    section="Q2 · Trying to improve it",
-    title="Monthly trading cut costs, but gave up more than it saved",
-    body=f"""
-<div class="two">
-{pts(f"Rebalancing the 21-day forecast once a month cut trading cost from "
-     f"{min(CAD[s]['daily']['drag'] for s in STYLES)*100:.0f}–{max(CAD[s]['daily']['drag'] for s in STYLES)*100:.0f}% "
-     f"a year to {min(CAD[s]['monthly']['drag'] for s in STYLES)*100:.0f}–{max(CAD[s]['monthly']['drag'] for s in STYLES)*100:.0f}%.")}
-{pts("But holding a month-old ranking earns much less before costs. Net, every style ends up <strong>lower</strong> "
-     "than trading the same forecast daily with M2.",
-     "Cheaper trading only helps when there is a forecast worth trading.")}
-</div>
-""",
-    body_class="body",
-    figure='<div class="two">' + svg_bars([STYLE_LAB[s] for s in STYLES], [
-        {"name": "traded daily", "values": [CAD[s]["daily"]["drag"] * 100 for s in STYLES], "cls": "cn"},
-        {"name": "rebalanced monthly", "values": [CAD[s]["monthly"]["drag"] * 100 for s in STYLES], "cls": "c2"},
-    ], w=520, h=290, ytitle="trading cost, % per year", value_fmt=lambda v: fmt(v, 1) + "%") + svg_bars(
-        [STYLE_LAB[s] for s in STYLES], [
-        {"name": "traded daily", "values": [CAD[s]["daily"]["sr"] for s in STYLES], "cls": "cn"},
-        {"name": "rebalanced monthly", "values": [CAD[s]["monthly"]["sr"] for s in STYLES], "cls": "c2", "neg_cls": "c3"},
-    ], w=520, h=290, ytitle="Sharpe ratio after costs", value_fmt=lambda v: fmt(v, 2)) + "</div>",
-    legend_items=[("21-day forecast, traded daily with M2 (Phase 5)", "cn"), ("21-day forecast, rebalanced monthly (Phase 6)", "c2")],
-    caption=("The daily numbers come from Phase 5, before the leak fix, which cost about 13% of the 21-day forecast's "
-             "skill. That can explain only part of the gap: before costs, Sharpe falls from "
-             f"{min(CAD[s]['daily']['gsr'] for s in STYLES):.2f}–{max(CAD[s]['daily']['gsr'] for s in STYLES):.2f} "
-             f"to {min(CAD[s]['monthly']['gsr'] for s in STYLES):.2f}–{max(CAD[s]['monthly']['gsr'] for s in STYLES):.2f}. " + SHARPE_NOTE),
-)
-
-# 17 · scorecard
-slide(
-    layout="split",
-    section="Q2 · Trying to improve it",
-    title="Scorecard: still short of the bar",
-    body=f"""
-{pts(f"The best strategy is the one we started with: {BEST_NAME}, base data, leak-free.",
-     f"Before costs it reaches {fmt(BEST['gsr'])}. After costs, <strong>{fmt(BEST['sr'])}</strong>.",
-     f"Luck alone, across {N_TRIALS} attempts, would produce about <strong>{fmt(SR_STAR)}</strong>. "
-     f"A pass needs about <strong>{BAR_SR:.1f}</strong>.",
-     f"The luck-test score is <strong>{BEST['dsr']:.2f}</strong>: about a {BEST['dsr']*100:.0f}% chance it beats luck. A pass needs 0.95.")}
-<p class="cite">Deflated Sharpe Ratio: Bailey &amp; López de Prado (2014). Autocorrelation adjustment: Lo (2002).</p>
-""",
-    figure=bars_colored(["no costs", "after costs"], [BEST["gsr"], BEST["sr"]], ["c1", "c1"],
-        w=620, h=330, ytitle=f"Sharpe ratio ({BEST_NAME}, base data)", barw=100,
-        ref=[{"y": BAR_SR, "label": f"needed|≈ {BAR_SR:.1f}"}, {"y": SR_STAR, "label": f"luck alone|{SR_STAR:.2f}"}]),
-    caption=SHARPE_NOTE + " Benchmarks use this strategy's own track length, skew and kurtosis.",
-)
-
-# 18 · the holdout
-slide(
-    layout="figure",
-    section="What next",
-    title="The test we chose not to spend",
-    body=f"""
-<div class="two">
-{pts("The plan's last step was to score all 18 strategies on the held-back data. It was <strong>not run</strong>.",
-     "None had passed, so the step could not change the verdict. It could only use up the data.")}
-{pts("A holdout is clean only until someone looks at it. After that, every later idea has been shaped by it.",
-     "It stays sealed for the next idea, which must be written down in full before it is opened.")}
-</div>
-""",
-    body_class="body",
-    figure=diagram_holdout(),
-)
-
-# 19 · where profit could still come from
+# 11 · where profit could still come from
 slide(
     layout="text",
     section="What next",
@@ -1092,13 +834,14 @@ slide(
 <span class="x">more price, index or options features</span>
 <span class="x">re-tuning the model or the cost rule</span>
 <span class="x">picking a winning variant from these results</span></div>
-<p class="aside" style="margin-top:16px">Each idea gets its own written plan, its own count of attempts, and one look at the sealed data.</p>
+<p class="aside" style="margin-top:16px">The held-back data was <strong>not</strong> spent on these 18 failures: scoring
+them could not change the verdict, only use it up. It stays sealed for one of these ideas, written down in full first.</p>
 """,
     notes=("Futures basis looks like the obvious candidate, but it was found in this data. Testing it here would be "
            "selection. Only the sealed holdout can say whether it is real."),
 )
 
-# 20 · takeaways
+# 12 · takeaways
 slide(
     layout="text",
     section="Takeaways",
@@ -1109,7 +852,10 @@ slide(
 {pts("<strong>Why it faded</strong>: the crowded low-volatility signals lost about "
      f"{FADE*100:.0f}% of their strength. Short-term reversal held. No model, not even one that sees the future, recovers it.",
      "<strong>The honest baseline</strong> is lower than we thought: "
-     f"{fmt(BEST['sr'])} after fixing a small training leak, not {fmt(P5_M2['sr'])}.")}
+     f"{fmt(BEST['sr'])} after fixing a small training leak, not {fmt(P5_M2['sr'])}.",
+     f"<strong>Monthly rebalancing</strong> cut trading cost to "
+     f"{min(CAD[s]['monthly']['drag'] for s in STYLES)*100:.0f}–{max(CAD[s]['monthly']['drag'] for s in STYLES)*100:.0f}% "
+     "a year, but gave up more return than it saved.")}
 {pts("<strong>New data made things worse</strong>: forecast skill roughly halved, and all 6 strategies lost Sharpe. "
      "The good new signals were diluted in the mix.",
      "<strong>Next</strong>: genuinely new information (delivery) or a different source of return, "
@@ -1168,9 +914,9 @@ slide(
 <li>Lo, A. (2002). The statistics of Sharpe ratios. <em>Financial Analysts Journal</em> 58(4).
 <span class="why">Sharpe ratios adjusted for autocorrelation throughout.</span></li>
 <li>López de Prado, M. (2018). <em>Advances in Financial Machine Learning</em>, ch. 7. Wiley.
-<span class="why">Purging training labels that overlap the test period (slide 11).</span></li>
+<span class="why">Purging training labels that overlap the test period (slide 9).</span></li>
 <li>McLean, R. D. &amp; Pontiff, J. (2016). Does academic research destroy stock return predictability? <em>Journal of Finance</em> 71(1).
-<span class="why">Anomalies lose much of their return after publication (slide 8).</span></li>
+<span class="why">Anomalies lose much of their return after publication (slide 6).</span></li>
 <li>Ang, A., Hodrick, R., Xing, Y. &amp; Zhang, X. (2006). The cross-section of volatility and expected returns. <em>Journal of Finance</em> 61(1).
 <span class="why">The low-volatility anomaly.</span></li>
 <li>Frazzini, A. &amp; Pedersen, L. (2014). Betting against beta. <em>Journal of Financial Economics</em> 111(1).
@@ -1182,7 +928,7 @@ slide(
 <li>Black, F. (1976). The pricing of commodity contracts. <em>Journal of Financial Economics</em> 3(1–2).
 <span class="why">Implied volatility of NSE stock options from futures prices.</span></li>
 <li>SEBI (2024). Analysis of profit and loss of individual traders dealing in equity F&amp;O segment.
-<span class="why">Most individual F&amp;O traders lose money (slide 19).</span></li>
+<span class="why">Most individual F&amp;O traders lose money (slide 11).</span></li>
 </ol>
 """,
 )
